@@ -10,6 +10,7 @@ import {
   romanizeChord,
   type KeySig,
   signedSemitoneDiff,
+  type OmitFlags,
 } from "../lib/voicing";
 import { PianoKeyboard } from "../app/PianoKeyboard";
 
@@ -80,8 +81,23 @@ export default function Page() {
     Array.from({ length: MAX_PADS }, () => "PAD_TRIAD_BASS_35R")
   );
 
+  const [padOmits, setPadOmits] = useState<OmitFlags[]>(() =>
+    Array.from({ length: MAX_PADS }, () => ({
+      root: false,
+      third: false,
+      fifth: false,
+      seventh: false,
+    }))
+  );
+
   const setPadPresetAt = (i: number, p: PadVoicingPreset) => {
     setPadPresets((prev) => prev.map((v, idx) => (idx === i ? p : v)));
+  };
+
+  const setPadOmitAt = (i: number, patch: Partial<OmitFlags>) => {
+    setPadOmits((prev) =>
+      prev.map((v, idx) => (idx === i ? { ...v, ...patch } : v))
+    );
   };
 
   // --- performance ---
@@ -177,6 +193,7 @@ export default function Page() {
     return Array.from({ length: MAX_PADS }, (_, i) => {
       const chord = chordSymbols[i] ?? "";
       const preset = padPresets[i] ?? "PAD_TRIAD_BASS_35R";
+      const omit = padOmits[i] ?? {};
 
       if (!chord) {
         return {
@@ -187,10 +204,11 @@ export default function Page() {
           notes: [] as string[],
           midis: [] as number[],
           ok: false,
+          omit,
         };
       }
 
-      const v = buildPadVoicing(chord, centerOctave, preset, shift);
+      const v = buildPadVoicing(chord, centerOctave, preset, shift, { omit });
       const roman = romanizeChord(chord, analysisKey);
 
       return {
@@ -201,9 +219,10 @@ export default function Page() {
         notes: v?.notes ?? [],
         midis: v?.midis ?? [],
         ok: Boolean(v),
+        omit,
       };
     });
-  }, [chordSymbols, padPresets, centerOctave, shift, analysisKey]);
+  }, [chordSymbols, padPresets, padOmits, centerOctave, shift, analysisKey]);
 
   // keep latest models/perf/shift in refs for stable event handlers
   const padModelsRef = useRef(padModels);
@@ -1086,6 +1105,53 @@ export default function Page() {
                       </option>
                     ))}
                   </select>
+
+                  <div style={styles.padSelectLabel}>Omit (per-pad)</div>
+                  <div style={styles.omitRow}>
+                    <label style={styles.chkMini}>
+                      <input
+                        type="checkbox"
+                        checked={!!p.omit?.root}
+                        onChange={(e) =>
+                          setPadOmitAt(p.idx, { root: e.target.checked })
+                        }
+                      />
+                      <span>omit R</span>
+                    </label>
+
+                    <label style={styles.chkMini}>
+                      <input
+                        type="checkbox"
+                        checked={!!p.omit?.third}
+                        onChange={(e) =>
+                          setPadOmitAt(p.idx, { third: e.target.checked })
+                        }
+                      />
+                      <span>omit 3</span>
+                    </label>
+
+                    <label style={styles.chkMini}>
+                      <input
+                        type="checkbox"
+                        checked={!!p.omit?.fifth}
+                        onChange={(e) =>
+                          setPadOmitAt(p.idx, { fifth: e.target.checked })
+                        }
+                      />
+                      <span>omit 5</span>
+                    </label>
+
+                    <label style={styles.chkMini}>
+                      <input
+                        type="checkbox"
+                        checked={!!p.omit?.seventh}
+                        onChange={(e) =>
+                          setPadOmitAt(p.idx, { seventh: e.target.checked })
+                        }
+                      />
+                      <span>omit 7</span>
+                    </label>
+                  </div>
                 </div>
               );
             })}
@@ -1338,6 +1404,20 @@ const styles: Record<string, React.CSSProperties> = {
     fontSize: 11,
     color: "#94a3b8",
     fontWeight: 800,
+  },
+  omitRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "center",
+    paddingTop: 2,
+  },
+  chkMini: {
+    display: "flex",
+    gap: 6,
+    alignItems: "center",
+    fontSize: 12,
+    color: "#cbd5e1",
   },
 
   // log

@@ -14,6 +14,9 @@ export type KeySig = { tonic: string; mode: "major" | "minor" };
 export type PadVoicingPreset =
   | "PAD_TRIAD_BASS_35R"
   | "DROP2_1357_NO_BASS"
+  | "DROP3_1357_NO_BASS"
+  | "DROP24_1357_NO_BASS"
+  | "DROP4_1357_NO_BASS"
   | "SHELL_R37_NO_BASS"
   | "GUIDE_379_NO_BASS"
   | "ROOTLESS_37_9_NO_BASS";
@@ -21,10 +24,24 @@ export type PadVoicingPreset =
 export const PAD_PRESETS: { id: PadVoicingPreset; label: string }[] = [
   { id: "PAD_TRIAD_BASS_35R", label: "PAD (Triad) = bass + 3-5-R’" },
   { id: "DROP2_1357_NO_BASS", label: "Drop2 = 1-3-5-7 (no bass)" },
+  { id: "DROP3_1357_NO_BASS", label: "Drop3 = 1-3-5-7 (no bass)" },
+  { id: "DROP24_1357_NO_BASS", label: "Drop2&4 = 1-3-5-7 (no bass)" },
+  { id: "DROP4_1357_NO_BASS", label: "Drop4 = 1-3-5-7 (no bass)" },
   { id: "SHELL_R37_NO_BASS", label: "Shell = R-3-7 (no bass)" },
   { id: "GUIDE_379_NO_BASS", label: "Guide = 3-7-9(+R) (no bass)" },
   { id: "ROOTLESS_37_9_NO_BASS", label: "Rootless = 3-7-9-13 (no bass)" },
 ];
+
+export type OmitFlags = {
+  root?: boolean;
+  third?: boolean;
+  fifth?: boolean;
+  seventh?: boolean;
+};
+
+export type VoicingOptions = {
+  omit?: OmitFlags;
+};
 
 export type VoicingResult = {
   chordSymbol: string;
@@ -170,43 +187,49 @@ function applyShift(midis: number[], shift: number) {
 
 // -------------------- Voicing builders --------------------
 
-function buildClosed1357(p: Parsed, centerOctave: number): number[] {
-  const r = rootPc(p);
-  const t3 = thirdPc(p) ?? r;
-  const t5 = fifthPc(p) ?? r;
-  const t7 = seventhPc(p) ?? r;
-
-  // closed: r(低) 3 5 7（centerOctave-1 を起点にする）
+function buildClosedFromPcs(anchorPc: string, pcs: string[], centerOctave: number): number[] {
+  if (!pcs.length) return [];
   const baseOct = Math.max(1, centerOctave - 1);
-  const min = midiFrom(r, baseOct) - 1;
+  let min = midiFrom(anchorPc, baseOct) - 1;
 
-  const rM = nearestAbove(r, min + 1, baseOct);
-  const m3 = nearestAbove(t3, rM + 1, baseOct);
-  const m5 = nearestAbove(t5, m3 + 1, baseOct);
-  const m7 = nearestAbove(t7, m5 + 1, baseOct);
-
-  return [rM, m3, m5, m7];
+  const placed: number[] = [];
+  for (const pc of pcs) {
+    const m = nearestAbove(pc, min + 1, baseOct);
+    placed.push(m);
+    min = m + 1;
+  }
+  return placed;
 }
 
-function drop2FromClosed(closed: number[]): number[] {
+type DropKind = "drop2" | "drop3" | "drop24" | "drop4";
+function applyDrop(closed: number[], kind: DropKind): number[] {
+  // drop は 4声が前提。omit 等で 4未満の場合はそのまま。
   if (closed.length !== 4) return closed;
-  // closed [v1 v2 v3 v4] (low..high)
-  // drop2: 2nd highest (v3) を 1oct 下げる
-  const [v1, v2, v3, v4] = closed;
-  const v3d = v3 - 12;
-  const res = [v1, v2, v3d, v4].sort((a, b) => a - b);
-  return res;
+  const [v1, v2, v3, v4] = closed; // low..high
+
+  // top order: v4(1st), v3(2nd), v2(3rd), v1(4th)
+  if (kind === "drop2") return [v1, v2, v3 - 12, v4].sort((a, b) => a - b);
+  if (kind === "drop3") return [v1, v2 - 12, v3, v4].sort((a, b) => a - b);
+  if (kind === "drop4") return [v1 - 12, v2, v3, v4].sort((a, b) => a - b);
+  return [v1 - 12, v2, v3 - 12, v4].sort((a, b) => a - b);
+}
+
+function omitOk(deg: keyof OmitFlags, omit?: OmitFlags) {
+  if (!omit) return true;
+  return !omit[deg];
 }
 
 export function buildPadVoicing(
   chordSymbol: string,
   centerOctave: number,
   preset: PadVoicingPreset,
-  transposeShift: number
+  transposeShift: number,
+  opts: VoicingOptions = {}
 ): VoicingResult | null {
   const p = parseChordSymbol(chordSymbol);
   if (!p) return null;
 
+  const omit = opts.omit;
   const r = rootPc(p);
   const t3 = thirdPc(p);
   const t5 = fifthPc(p);
@@ -224,28 +247,86 @@ export function buildPadVoicing(
     const bassOct = Math.max(1, centerOctave - 2);
     const bass = midiFrom(bassPc, bassOct);
 
-    let min = bass + 2;
-    const m3 = nearestAbove(t3 ?? r, min, centerOctave - 1);
-    min = m3 + 2;
-    const m5 = nearestAbove(t5 ?? r, min, centerOctave - 1);
-    min = m5 + 2;
-    const topR = nearestAbove(r, min, centerOctave);
+    const tmp: number[] = [];
+    if (!(omit?.root && bassPc === r)) tmp.push(bass);
 
-    midis = [bass, m3, m5, topR];
+    let cursor = tmp.length ? tmp[tmp.length - 1] + 2 : bass - 6;
+    if (omitOk("third", omit)) {
+      const m3 = nearestAbove(t3 ?? r, cursor, centerOctave - 1);
+      tmp.push(m3);
+      cursor = m3 + 2;
+    }
+    if (omitOk("fifth", omit)) {
+      const m5 = nearestAbove(t5 ?? r, cursor, centerOctave - 1);
+      tmp.push(m5);
+      cursor = m5 + 2;
+    }
+    if (omitOk("root", omit)) {
+      const topR = nearestAbove(r, cursor, centerOctave);
+      tmp.push(topR);
+    }
+
+    midis = tmp;
     midis = clampLowMud(midis, 55);
   }
 
   if (preset === "DROP2_1357_NO_BASS") {
-    // 1-3-5-7 を作って drop2（bass無し）
-    const closed = buildClosed1357(p, centerOctave);
-    midis = drop2FromClosed(closed);
+    // 1-3-5-7 を作って drop（bass無し）
+    const pcs: string[] = [];
+    if (omitOk("root", omit)) pcs.push(r);
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("fifth", omit)) pcs.push(t5 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+
+    const closed = buildClosedFromPcs(r, pcs, centerOctave);
+    midis = applyDrop(closed, "drop2");
+    midis = clampLowMud(midis, 58);
+  }
+
+  if (preset === "DROP3_1357_NO_BASS") {
+    const pcs: string[] = [];
+    if (omitOk("root", omit)) pcs.push(r);
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("fifth", omit)) pcs.push(t5 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+
+    const closed = buildClosedFromPcs(r, pcs, centerOctave);
+    midis = applyDrop(closed, "drop3");
+    midis = clampLowMud(midis, 58);
+  }
+
+  if (preset === "DROP24_1357_NO_BASS") {
+    const pcs: string[] = [];
+    if (omitOk("root", omit)) pcs.push(r);
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("fifth", omit)) pcs.push(t5 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+
+    const closed = buildClosedFromPcs(r, pcs, centerOctave);
+    midis = applyDrop(closed, "drop24");
+    midis = clampLowMud(midis, 58);
+  }
+
+  if (preset === "DROP4_1357_NO_BASS") {
+    const pcs: string[] = [];
+    if (omitOk("root", omit)) pcs.push(r);
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("fifth", omit)) pcs.push(t5 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+
+    const closed = buildClosedFromPcs(r, pcs, centerOctave);
+    midis = applyDrop(closed, "drop4");
     midis = clampLowMud(midis, 58);
   }
 
   if (preset === "SHELL_R37_NO_BASS") {
     // R-3-7 + (5 or 9)（bass無し）
     // 7th強調で濁りが出やすいので上側に寄せる
-    const pcs = [r, t3 ?? r, t7 ?? (t5 ?? r), t9 ?? (t5 ?? r)];
+    const pcs: string[] = [];
+    if (omitOk("root", omit)) pcs.push(r);
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+    pcs.push(t9 ?? (t5 ?? r));
     let min = midiFrom(r, Math.max(1, centerOctave - 1)) - 1;
 
     const placed: number[] = [];
@@ -259,7 +340,11 @@ export function buildPadVoicing(
 
   if (preset === "GUIDE_379_NO_BASS") {
     // 3-7-9 + (R)（bass無し / 5th省略）
-    const pcs = [t3 ?? r, t7 ?? (t5 ?? r), t9 ?? (t5 ?? r), r];
+    const pcs: string[] = [];
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+    pcs.push(t9 ?? (t5 ?? r));
+    if (omitOk("root", omit)) pcs.push(r);
     let min = midiFrom(r, Math.max(1, centerOctave - 1)) - 1;
 
     const placed: number[] = [];
@@ -273,7 +358,11 @@ export function buildPadVoicing(
 
   if (preset === "ROOTLESS_37_9_NO_BASS") {
     // 3-7-9-13（bass無し）: 13が無い場合は5thで代用
-    const pcs = [t3 ?? r, t7 ?? (t5 ?? r), t9 ?? (t5 ?? r), t13 ?? (t5 ?? r)];
+    const pcs: string[] = [];
+    if (omitOk("third", omit)) pcs.push(t3 ?? r);
+    if (omitOk("seventh", omit)) pcs.push(t7 ?? (t5 ?? r));
+    pcs.push(t9 ?? (t5 ?? r));
+    pcs.push(t13 ?? (t5 ?? r));
     let min = midiFrom(r, Math.max(1, centerOctave - 1)) - 1;
 
     const placed: number[] = [];
@@ -283,6 +372,11 @@ export function buildPadVoicing(
       min = m + 1;
     }
     midis = clampLowMud(placed, 62);
+  }
+
+  if (!midis.length) {
+    const fallbackPc = slashBass ?? r;
+    midis = [midiFrom(fallbackPc, Math.max(1, centerOctave - 1))];
   }
 
   // 移調
