@@ -1,3 +1,4 @@
+// app/PianoKeyboard.tsx
 "use client";
 
 import React, { useMemo, useRef, useEffect, useState } from "react";
@@ -112,8 +113,7 @@ export function PianoKeyboard({
   const blackW = whiteW * 0.62;
   const blackH = whiteH * 0.62;
 
-  const onDown = async (midi: number) => {
-    await Tone.start();
+  const onDown = (midi: number) => {
     onKeyPress?.(midi);
   };
 
@@ -136,6 +136,7 @@ export function PianoKeyboard({
         background: "rgba(2,6,23,0.25)",
         overflow: "hidden",
         userSelect: "none",
+        touchAction: "none",
       }}
     >
       {/* white keys */}
@@ -149,7 +150,10 @@ export function PianoKeyboard({
           return (
             <div
               key={`w-${k.midi}`}
-              onMouseDown={() => onDown(k.midi)}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                onDown(k.midi);
+              }}
               style={{
                 position: "absolute",
                 left: x,
@@ -183,7 +187,10 @@ export function PianoKeyboard({
           return (
             <div
               key={`b-${k.midi}`}
-              onMouseDown={() => onDown(k.midi)}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                onDown(k.midi);
+              }}
               style={{
                 position: "absolute",
                 left: x,

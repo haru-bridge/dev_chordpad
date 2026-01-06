@@ -1,3 +1,4 @@
+// app/dev/page.tsx  (※パスはあなたの実ファイル構成に合わせて調整)
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
@@ -32,7 +33,7 @@ type LogRow = {
   perf: PerformanceSettings;
 };
 
-const MAX_PADS = 12;
+const MAX_PADS = 16;
 
 const KEY_ROOTS = [
   "C",
@@ -55,6 +56,11 @@ type KeyMode = "major" | "minor";
 function nowStr() {
   return new Date().toLocaleTimeString();
 }
+
+type HoldState = {
+  notes: string[];
+  scheduleIds: number[]; // Tone.Transport.scheduleOnce ids
+};
 
 export default function Page() {
   // --- core input ---
@@ -98,11 +104,10 @@ export default function Page() {
   // --- audio refs ---
   const synthRef = useRef<Tone.PolySynth | null>(null);
   const limiterRef = useRef<Tone.Limiter | null>(null);
+  const audioReadyRef = useRef(false);
 
-  // key-hold state (1〜9): cancelable schedule
-  const activeHoldRef = useRef<
-    Record<number, { notes: string[]; timeouts: number[] }>
-  >({});
+  // hold state (multi-press allowed): cancelable schedule per pad idx
+  const activeHoldRef = useRef<Record<number, HoldState>>({});
 
   // -------------------------
   // Keyboard visualizer state
@@ -111,6 +116,20 @@ export default function Page() {
   const holdMidisRef = useRef<Record<number, number[]>>({});
   const oneShotMidisRef = useRef<number[]>([]);
   const oneShotTimerRef = useRef<number | null>(null);
+
+  const rafSyncRef = useRef<number | null>(null);
+  const requestSyncActiveMidis = () => {
+    if (rafSyncRef.current != null) return;
+    rafSyncRef.current = window.requestAnimationFrame(() => {
+      rafSyncRef.current = null;
+      const u = new Set<number>();
+      for (const arr of Object.values(holdMidisRef.current)) {
+        for (const m of arr) u.add(m);
+      }
+      for (const m of oneShotMidisRef.current) u.add(m);
+      setActiveMidis(Array.from(u).sort((a, b) => a - b));
+    });
+  };
 
   // -------------------------
   // Keyboard picker state
@@ -125,6 +144,11 @@ export default function Page() {
   const [guide9, setGuide9] = useState(true);
   const [guide11, setGuide11] = useState(false);
   const [guide13, setGuide13] = useState(false);
+
+  // -------------------------
+  // Dock UI state
+  // -------------------------
+  const [dockOpen, setDockOpen] = useState(true);
 
   const analysisKey: KeySig = useMemo(
     () => ({ tonic: analysisRoot, mode: analysisMode }),
@@ -181,6 +205,21 @@ export default function Page() {
     });
   }, [chordSymbols, padPresets, centerOctave, shift, analysisKey]);
 
+  // keep latest models/perf/shift in refs for stable event handlers
+  const padModelsRef = useRef(padModels);
+  const perfRef = useRef(perf);
+  const shiftRef = useRef(shift);
+
+  useEffect(() => {
+    padModelsRef.current = padModels;
+  }, [padModels]);
+  useEffect(() => {
+    perfRef.current = perf;
+  }, [perf]);
+  useEffect(() => {
+    shiftRef.current = shift;
+  }, [shift]);
+
   const romanProgression = useMemo(() => {
     const romans = chordSymbols
       .map((c) => romanizeChord(c, analysisKey))
@@ -204,49 +243,130 @@ export default function Page() {
     return synth;
   };
 
+  const ensureAudioReady = async () => {
+    // Always try to resume on user gesture (iOS can suspend)
+    await Tone.start();
+    ensureSynth();
+
+    if (Tone.Transport.state !== "started") {
+      // Needed for scheduleOnce callbacks to fire
+      Tone.Transport.start();
+    }
+
+    audioReadyRef.current = true;
+  };
+
   const pushLog = (row: LogRow) => {
     setLogs((p) => [row, ...p].slice(0, 200));
     console.log("PLAY", row);
   };
 
-  const syncActiveMidis = () => {
-    const u = new Set<number>();
-    for (const arr of Object.values(holdMidisRef.current)) {
-      for (const m of arr) u.add(m);
-    }
-    for (const m of oneShotMidisRef.current) u.add(m);
-    setActiveMidis(Array.from(u).sort((a, b) => a - b));
-  };
-
-  const clearAllHoldsAndTimers = () => {
-    const holds = activeHoldRef.current;
-    for (const k of Object.keys(holds)) {
-      const idx = Number(k);
-      const h = holds[idx];
-      if (!h) continue;
-      h.timeouts.forEach((id) => window.clearTimeout(id));
-      delete holds[idx];
-    }
-
-    holdMidisRef.current = {};
-
+  const clearOneShotViz = () => {
     if (oneShotTimerRef.current !== null) {
       window.clearTimeout(oneShotTimerRef.current);
       oneShotTimerRef.current = null;
     }
     oneShotMidisRef.current = [];
-    syncActiveMidis();
+  };
+
+  const stopHoldByIndex = (idx: number) => {
+    const h = activeHoldRef.current[idx];
+    if (!h) return;
+
+    // cancel scheduled attacks for this hold only
+    h.scheduleIds.forEach((id) => Tone.Transport.clear(id));
+
+    const synth = synthRef.current;
+    if (synth) synth.triggerRelease(h.notes, Tone.now());
+
+    delete activeHoldRef.current[idx];
+    delete holdMidisRef.current[idx];
+    requestSyncActiveMidis();
+  };
+
+  const startHoldByIndex = async (idx: number) => {
+    const p = padModelsRef.current[idx];
+    if (!p?.ok || !p.notes.length) return;
+    if (activeHoldRef.current[idx]) return; // already holding
+
+    setGuidePadIdx(idx);
+
+    await ensureAudioReady();
+    const synth = ensureSynth();
+
+    // Visualizer: light full chord immediately (stable, cheap)
+    holdMidisRef.current[idx] = p.midis;
+    requestSyncActiveMidis();
+
+    // schedule strum/arp attacks via Transport (cancelable, less timer jitter)
+    const events = buildNoteEvents(p.notes, p.midis, perfRef.current, 0.9);
+
+    const scheduleIds: number[] = [];
+    const notesToRelease: string[] = [];
+
+    for (const ev of events) {
+      notesToRelease.push(ev.note);
+
+      const delaySec = Math.max(0, ev.delayMs) / 1000;
+      const id = Tone.Transport.scheduleOnce((time) => {
+        // Use `time` provided by Tone for sample-accurate scheduling
+        synth.triggerAttack(ev.note, time, ev.velocity);
+      }, `+${delaySec}`);
+
+      scheduleIds.push(id);
+    }
+
+    activeHoldRef.current[idx] = { notes: notesToRelease, scheduleIds };
+
+    // Log only at hold start (avoid spam)
+    pushLog({
+      t: nowStr(),
+      chord: p.chord,
+      roman: p.roman,
+      preset: p.preset,
+      notes: p.notes,
+      midis: p.midis,
+      shift: shiftRef.current,
+      perf: perfRef.current,
+    });
   };
 
   const stopAll = () => {
+    // cancel everything scheduled
     Tone.Transport.stop();
     Tone.Transport.cancel(0);
 
-    clearAllHoldsAndTimers();
-
+    // release any held notes
     const synth = synthRef.current;
     if (synth) synth.releaseAll();
+
+    // clear holds bookkeeping
+    activeHoldRef.current = {};
+    holdMidisRef.current = {};
+
+    // clear viz one-shot
+    clearOneShotViz();
+    requestSyncActiveMidis();
   };
+
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== "visible") stopAll();
+    };
+    const onBlur = () => stopAll();
+    const onPageHide = () => stopAll();
+
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("blur", onBlur);
+    window.addEventListener("pagehide", onPageHide);
+
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      window.removeEventListener("blur", onBlur);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -271,61 +391,6 @@ export default function Page() {
   };
 
   // -------------------------
-  // Playback (One-shot) - pad click
-  // -------------------------
-  const playOneShotByPadIndex = async (idx: number) => {
-    const p = padModels[idx];
-    if (!p?.ok || !p.notes.length) return;
-
-    // ガイドの参照を「最後に鳴らしたPad」に寄せる
-    setGuidePadIdx(idx);
-
-    await Tone.start();
-    const synth = ensureSynth();
-
-    const chordDurSec = 0.85;
-    const events = buildNoteEvents(p.notes, p.midis, perf, chordDurSec);
-
-    const start = Tone.now();
-
-    // visualizer on (approx: chord全体を点灯)
-    if (oneShotTimerRef.current !== null) {
-      window.clearTimeout(oneShotTimerRef.current);
-      oneShotTimerRef.current = null;
-    }
-    oneShotMidisRef.current = p.midis;
-    syncActiveMidis();
-
-    events.forEach((ev) => {
-      synth.triggerAttackRelease(
-        ev.note,
-        ev.durSec,
-        start + ev.delayMs / 1000,
-        ev.velocity
-      );
-    });
-
-    const maxDelay = Math.max(0, ...events.map((e) => e.delayMs));
-    const maxDur = Math.max(0, ...events.map((e) => e.durSec * 1000));
-    oneShotTimerRef.current = window.setTimeout(() => {
-      oneShotMidisRef.current = [];
-      syncActiveMidis();
-      oneShotTimerRef.current = null;
-    }, Math.round(maxDelay + maxDur + 140));
-
-    pushLog({
-      t: nowStr(),
-      chord: p.chord,
-      roman: p.roman,
-      preset: p.preset,
-      notes: p.notes,
-      midis: p.midis,
-      shift,
-      perf,
-    });
-  };
-
-  // -------------------------
   // Keyboard hold (1..9)
   // -------------------------
   useEffect(() => {
@@ -338,67 +403,14 @@ export default function Page() {
       if (!Number.isFinite(n) || n < 1 || n > 9) return;
 
       const idx = n - 1;
-      const p = padModels[idx];
-      if (!p?.ok || !p.notes.length) return;
-
-      if (activeHoldRef.current[idx]) return;
-
-      setGuidePadIdx(idx);
-
-      await Tone.start();
-      const synth = ensureSynth();
-
-      // holdは Attack を並べて、keyUp で Release
-      const events = buildNoteEvents(p.notes, p.midis, perf, 0.9);
-
-      const timeouts: number[] = [];
-      const notesToRelease: string[] = [];
-
-      // visualizer hold on
-      holdMidisRef.current[idx] = p.midis;
-      syncActiveMidis();
-
-      events.forEach((ev) => {
-        notesToRelease.push(ev.note);
-
-        const id = window.setTimeout(() => {
-          synth.triggerAttack(ev.note, Tone.now(), ev.velocity);
-        }, Math.max(0, Math.round(ev.delayMs)));
-
-        timeouts.push(id);
-      });
-
-      activeHoldRef.current[idx] = { notes: notesToRelease, timeouts };
-
-      pushLog({
-        t: nowStr(),
-        chord: p.chord,
-        roman: p.roman,
-        preset: p.preset,
-        notes: p.notes,
-        midis: p.midis,
-        shift,
-        perf,
-      });
+      await startHoldByIndex(idx);
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
       const n = Number(e.key);
       if (!Number.isFinite(n) || n < 1 || n > 9) return;
-
       const idx = n - 1;
-      const h = activeHoldRef.current[idx];
-      if (!h) return;
-
-      h.timeouts.forEach((id) => window.clearTimeout(id));
-
-      const synth = synthRef.current;
-      if (synth) synth.triggerRelease(h.notes, Tone.now());
-
-      delete activeHoldRef.current[idx];
-
-      delete holdMidisRef.current[idx];
-      syncActiveMidis();
+      stopHoldByIndex(idx);
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -407,17 +419,19 @@ export default function Page() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
     };
-  }, [padModels, perf, shift]);
+    // startHoldByIndex/stopHoldByIndex are stable via refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // -------------------------
   // Keyboard click: play single note + suggest chords
   // -------------------------
   const playSingleMidi = async (midi: number) => {
-    await Tone.start();
+    await ensureAudioReady();
     const synth = ensureSynth();
 
     const note = Tone.Frequency(midi, "midi").toNote();
-    const events = buildNoteEvents([note], [midi], perf, 0.35);
+    const events = buildNoteEvents([note], [midi], perfRef.current, 0.35);
 
     const start = Tone.now();
     events.forEach((ev) => {
@@ -494,10 +508,84 @@ export default function Page() {
   }, [guideEnabled, guidePadIdx, padModels, kbRange, guide9, guide11, guide13]);
 
   // -------------------------
+  // Dock (4x4 performance pads; 1:1 mapping)
+  // -------------------------
+  const Dock = () => {
+    return (
+      <div style={styles.dockWrap}>
+        <button
+          type="button"
+          onClick={() => setDockOpen((v) => !v)}
+          style={styles.dockToggle}
+          title="PadDock"
+        >
+          {dockOpen ? "Dock×" : "Dock"}
+        </button>
+
+        {dockOpen ? (
+          <div style={styles.dockPanel}>
+            <div style={styles.dockGrid}>
+              {padModels.map((p) => {
+                const disabled = !p.ok;
+                return (
+                  <button
+                    key={`dock-${p.idx}`}
+                    type="button"
+                    disabled={disabled}
+                    onPointerDown={async (e) => {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLElement).setPointerCapture?.(
+                        e.pointerId
+                      );
+                      await startHoldByIndex(p.idx);
+                    }}
+                    onPointerUp={(e) => {
+                      e.preventDefault();
+                      stopHoldByIndex(p.idx);
+                      (e.currentTarget as HTMLElement).releasePointerCapture?.(
+                        e.pointerId
+                      );
+                    }}
+                    onPointerCancel={(e) => {
+                      e.preventDefault();
+                      stopHoldByIndex(p.idx);
+                    }}
+                    style={{
+                      ...styles.dockPad,
+                      opacity: disabled ? 0.35 : 1,
+                      cursor: disabled ? "not-allowed" : "pointer",
+                      outline:
+                        guidePadIdx === p.idx
+                          ? "2px solid rgba(147,197,253,0.55)"
+                          : "1px solid rgba(148,163,184,0.18)",
+                    }}
+                    title={
+                      p.chord ? `#${p.idx + 1} ${p.chord}` : `#${p.idx + 1}`
+                    }
+                  >
+                    <div style={styles.dockPadTop}>#{p.idx + 1}</div>
+                    <div style={styles.dockPadChord}>{p.chord || "—"}</div>
+                    <div style={styles.dockPadRoman}>{p.roman || " "}</div>
+                  </button>
+                );
+              })}
+            </div>
+            <div style={styles.dockHint}>
+              押している間鳴る（同時押しOK） / 離すと止まる
+            </div>
+          </div>
+        ) : null}
+      </div>
+    );
+  };
+
+  // -------------------------
   // UI
   // -------------------------
   return (
     <main style={styles.page}>
+      <Dock />
+
       <div style={styles.card}>
         <h1 style={styles.h1}>Tone.js Pad Voicing Test</h1>
 
@@ -581,7 +669,7 @@ export default function Page() {
           </div>
 
           <div style={{ display: "flex", gap: 8, alignItems: "end" }}>
-            <button onClick={stopAll} style={styles.btnDanger}>
+            <button onClick={stopAll} style={styles.btnDanger} type="button">
               Stop
             </button>
           </div>
@@ -792,8 +880,8 @@ export default function Page() {
           </div>
 
           <div style={styles.mutedSmall}>
-            Arpは「クリックした瞬間に1回だけ回す」。Hold(1〜9)は Attack
-            を並べて、KeyUpで Release。
+            Holdは Tone.Transport で Attack をスケジュール（キャンセル可能）。
+            1〜9キーも、Dockも、情報Padも「押している間鳴る / 離すと止まる」。
           </div>
         </section>
 
@@ -818,7 +906,7 @@ export default function Page() {
               <select
                 value={guidePadIdx}
                 onChange={(e) => setGuidePadIdx(Number(e.target.value))}
-                style={{ ...styles.select, height: 30, width: 120 }}
+                style={{ ...styles.select, height: 30, width: 140 }}
               >
                 {padModels.map((p) => (
                   <option key={p.idx} value={p.idx}>
@@ -915,7 +1003,7 @@ export default function Page() {
                 </>
               ) : (
                 <div style={styles.mutedSmall}>
-                  鍵盤をクリックすると単音が鳴り、そこから候補を出します。
+                  鍵盤をタップすると単音が鳴り、候補を出します。
                 </div>
               )}
             </div>
@@ -931,60 +1019,83 @@ export default function Page() {
 
         <section style={styles.section}>
           <div style={styles.label}>
-            Pads（クリックで試聴 / 1〜9でホールド） ※Padごとにボイシング指定
+            Pads（押している間鳴る / 1〜9でもホールド） ※Padごとにボイシング指定
           </div>
 
           <div style={styles.grid}>
-            {padModels.map((p) => (
-              <div key={p.idx} style={styles.padWrap}>
-                <button
-                  onClick={() => playOneShotByPadIndex(p.idx)}
-                  disabled={!p.ok}
-                  style={{
-                    ...styles.pad,
-                    opacity: p.ok ? 1 : 0.45,
-                    cursor: p.ok ? "pointer" : "not-allowed",
-                    outline:
-                      guidePadIdx === p.idx
-                        ? "2px solid rgba(147,197,253,0.55)"
-                        : "none",
-                  }}
-                >
-                  <div style={styles.padTop}>
-                    #{p.idx + 1} {p.chord || "—"}
-                  </div>
-                  <div style={styles.padRoman}>{p.roman || " "}</div>
-                  <div style={styles.padNotes}>
-                    {p.notes.length ? p.notes.join(" ") : "（解析できません）"}
-                  </div>
-                  <div style={styles.mutedSmall}>
-                    midis: {p.midis.length ? p.midis.join(", ") : "-"}
-                  </div>
-                </button>
+            {padModels.map((p) => {
+              const disabled = !p.ok;
+              return (
+                <div key={p.idx} style={styles.padWrap}>
+                  <button
+                    type="button"
+                    disabled={disabled}
+                    onPointerDown={async (e) => {
+                      e.preventDefault();
+                      (e.currentTarget as HTMLElement).setPointerCapture?.(
+                        e.pointerId
+                      );
+                      await startHoldByIndex(p.idx);
+                    }}
+                    onPointerUp={(e) => {
+                      e.preventDefault();
+                      stopHoldByIndex(p.idx);
+                      (e.currentTarget as HTMLElement).releasePointerCapture?.(
+                        e.pointerId
+                      );
+                    }}
+                    onPointerCancel={(e) => {
+                      e.preventDefault();
+                      stopHoldByIndex(p.idx);
+                    }}
+                    style={{
+                      ...styles.pad,
+                      opacity: disabled ? 0.45 : 1,
+                      cursor: disabled ? "not-allowed" : "pointer",
+                      outline:
+                        guidePadIdx === p.idx
+                          ? "2px solid rgba(147,197,253,0.55)"
+                          : "none",
+                    }}
+                  >
+                    <div style={styles.padTop}>
+                      #{p.idx + 1} {p.chord || "—"}
+                    </div>
+                    <div style={styles.padRoman}>{p.roman || " "}</div>
+                    <div style={styles.padNotes}>
+                      {p.notes.length
+                        ? p.notes.join(" ")
+                        : "（解析できません）"}
+                    </div>
+                    <div style={styles.mutedSmall}>
+                      midis: {p.midis.length ? p.midis.join(", ") : "-"}
+                    </div>
+                  </button>
 
-                <div style={styles.padSelectLabel}>Pad voicing preset</div>
-                <select
-                  value={p.preset}
-                  onChange={(e) =>
-                    setPadPresetAt(p.idx, e.target.value as PadVoicingPreset)
-                  }
-                  style={styles.select}
-                >
-                  {PAD_PRESETS.map((x) => (
-                    <option key={x.id} value={x.id}>
-                      {x.label}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            ))}
+                  <div style={styles.padSelectLabel}>Pad voicing preset</div>
+                  <select
+                    value={p.preset}
+                    onChange={(e) =>
+                      setPadPresetAt(p.idx, e.target.value as PadVoicingPreset)
+                    }
+                    style={styles.select}
+                  >
+                    {PAD_PRESETS.map((x) => (
+                      <option key={x.id} value={x.id}>
+                        {x.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              );
+            })}
           </div>
         </section>
 
         <section style={styles.section}>
           <div style={styles.sectionRow}>
             <div style={styles.label}>
-              Log（鳴らした履歴だけ積む / 最新が上）
+              Log（ホールド開始時だけ積む / 最新が上）
             </div>
             <button onClick={() => setLogs([])} style={styles.btnMini}>
               clear
@@ -1193,7 +1304,7 @@ const styles: Record<string, React.CSSProperties> = {
   // pads
   grid: {
     display: "grid",
-    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
     gap: 12,
   },
   padWrap: {
@@ -1211,6 +1322,7 @@ const styles: Record<string, React.CSSProperties> = {
     background: "radial-gradient(circle at 30% 30%, #1f2937, #020617 70%)",
     color: "#e5e7eb",
     userSelect: "none",
+    touchAction: "none",
   },
   padTop: { fontSize: 12, fontWeight: 900, marginBottom: 6 },
   padRoman: {
@@ -1251,4 +1363,75 @@ const styles: Record<string, React.CSSProperties> = {
   logChord: { color: "#e5e7eb" },
   logRoman: { color: "#93c5fd" },
   logNotes: { color: "#e5e7eb" },
+
+  // dock
+  dockWrap: {
+    position: "fixed",
+    right: 16,
+    bottom: 16,
+    zIndex: 50,
+    display: "flex",
+    flexDirection: "column",
+    alignItems: "flex-end",
+    gap: 10,
+    pointerEvents: "auto",
+  },
+  dockToggle: {
+    height: 36,
+    padding: "0 12px",
+    borderRadius: 999,
+    border: "1px solid rgba(148,163,184,0.25)",
+    background: "rgba(2,6,23,0.85)",
+    color: "#e5e7eb",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 12,
+    backdropFilter: "blur(6px)",
+  },
+  dockPanel: {
+    width: 320,
+    borderRadius: 16,
+    border: "1px solid rgba(148,163,184,0.18)",
+    background: "rgba(2,6,23,0.82)",
+    boxShadow: "0 18px 45px rgba(0,0,0,0.55)",
+    padding: 10,
+    backdropFilter: "blur(8px)",
+  },
+  dockGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(4, minmax(0, 1fr))",
+    gap: 8,
+    touchAction: "none",
+  },
+  dockPad: {
+    height: 68,
+    borderRadius: 14,
+    background: "radial-gradient(circle at 30% 30%, #1f2937, #020617 75%)",
+    color: "#e5e7eb",
+    border: "1px solid rgba(148,163,184,0.18)",
+    userSelect: "none",
+    touchAction: "none",
+    padding: 8,
+    textAlign: "left",
+  },
+  dockPadTop: { fontSize: 11, fontWeight: 900, color: "#cbd5e1" },
+  dockPadChord: {
+    fontSize: 12,
+    fontWeight: 900,
+    marginTop: 2,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+  },
+  dockPadRoman: {
+    fontSize: 11,
+    marginTop: 2,
+    color: "#93c5fd",
+    fontWeight: 800,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+  },
+  dockHint: {
+    marginTop: 8,
+    fontSize: 11,
+    color: "#94a3b8",
+    fontWeight: 700,
+  },
 };
