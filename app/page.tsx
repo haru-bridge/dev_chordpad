@@ -589,17 +589,23 @@ export default function Page() {
     setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
   };
 
-  const lastRoman = useMemo(() => {
-    const lastChord = chordSymbols[chordSymbols.length - 1];
-    return lastChord ? romanizeChord(lastChord, analysisKey) : "";
-  }, [chordSymbols, analysisKey]);
+  const romanContext = useMemo(
+    () => chordSymbols.map((chord) => romanizeChord(chord, analysisKey)),
+    [chordSymbols, analysisKey]
+  );
+
+  const lastRoman = romanContext[romanContext.length - 1] ?? "";
 
   const nextChordSuggestions = useMemo(() => {
-    return suggestNextRomans(lastRoman).map((suggestion) => ({
+    return suggestNextRomans(
+      lastRoman,
+      romanContext,
+      analysisKey.mode
+    ).map((suggestion) => ({
       ...suggestion,
       chord: romanTokenToChord(suggestion.token, analysisKey),
     }));
-  }, [lastRoman, analysisKey]);
+  }, [lastRoman, romanContext, analysisKey]);
 
   const appendNextChord = (chord: string) => {
     setText((prev) => {

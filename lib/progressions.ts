@@ -583,42 +583,51 @@ export const SECTION_SHAPES: SectionShape[] = [
 
 const NEXT_BY_DEGREE: Record<string, NextRomanSuggestion[]> = {
   I: [
-    { token: "IVmaj7", label: "open" },
-    { token: "V7", label: "push" },
-    { token: "vi7", label: "soft" },
-    { token: "ii7", label: "jazz" },
+    { token: "IV", label: "open" },
+    { token: "V", label: "push" },
+    { token: "vi", label: "soft" },
+    { token: "IVmaj7", label: "color" },
+    { token: "ii7", label: "pre-dom" },
   ],
   II: [
-    { token: "V7", label: "resolve" },
-    { token: "IVmaj7", label: "lift" },
+    { token: "V", label: "resolve" },
+    { token: "V7", label: "strong" },
+    { token: "IV", label: "lift" },
     { token: "bVII", label: "modal" },
+    { token: "ii9", label: "neo" },
   ],
   III: [
-    { token: "vi7", label: "fall" },
-    { token: "IVmaj7", label: "bright" },
-    { token: "VI7", label: "dominant" },
+    { token: "vi", label: "fall" },
+    { token: "IV", label: "bright" },
+    { token: "VI7", label: "to ii" },
+    { token: "iii7", label: "color" },
   ],
   IV: [
-    { token: "V7", label: "royal" },
-    { token: "Imaj7", label: "home" },
-    { token: "iii7", label: "j-pop" },
+    { token: "V", label: "royal" },
+    { token: "I", label: "home" },
+    { token: "iii", label: "j-pop" },
     { token: "iv7", label: "borrow" },
+    { token: "IVmaj9", label: "float" },
   ],
   V: [
-    { token: "Imaj7", label: "resolve" },
-    { token: "vi7", label: "deceptive" },
+    { token: "I", label: "resolve" },
+    { token: "Imaj7", label: "soft" },
+    { token: "vi", label: "deceptive" },
     { token: "IV", label: "loop" },
+    { token: "Iadd9", label: "open" },
   ],
   VI: [
-    { token: "IVmaj7", label: "pop" },
-    { token: "ii7", label: "circle" },
-    { token: "V7", label: "push" },
+    { token: "IV", label: "pop" },
+    { token: "ii", label: "circle" },
+    { token: "V", label: "push" },
+    { token: "III7", label: "back" },
     { token: "bVII", label: "minor" },
   ],
   VII: [
-    { token: "Imaj7", label: "resolve" },
+    { token: "I", label: "resolve" },
     { token: "III", label: "lift" },
     { token: "IV", label: "modal" },
+    { token: "Imaj7", label: "soft" },
   ],
 };
 
@@ -630,19 +639,19 @@ const SECTION_PATTERNS: Record<Exclude<SectionShapeId, "continue">, string[][]> 
     ["I", "bVII", "IV", "I"],
   ],
   story: [
-    ["I", "V", "vi7", "IVmaj7", "ii7", "V7", "Imaj7", "V7"],
-    ["Imaj7", "iii7", "IVmaj7", "iv7", "ii7", "V7", "Imaj7", "V7"],
-    ["vi7", "IVmaj7", "I", "V7", "ii7", "V7", "Imaj7", "V7"],
+    ["I", "V", "vi", "IV", "ii7", "V7", "I", "V"],
+    ["Imaj7", "iii", "IVmaj7", "iv", "ii", "V7", "I", "V"],
+    ["vi", "IV", "I", "V", "ii7", "V7", "Iadd9", "V"],
   ],
   lift: [
-    ["IVmaj7", "V7", "iii7", "vi7", "ii7", "V7", "Imaj7", "Imaj7"],
-    ["I", "III7", "vi7", "IVmaj7", "ii7", "V7", "Imaj7", "V7"],
+    ["IV", "V", "iii", "vi", "ii7", "V7", "I", "Iadd9"],
+    ["I", "III7", "vi", "IVmaj7", "ii", "V7", "I", "V"],
     ["IV", "V", "vi", "I", "ii7", "V7", "Imaj7", "V7"],
   ],
   float: [
     ["Imaj7", "iii7", "IVmaj7", "iv7"],
     ["Imaj7", "IVmaj7", "iii7", "vi7"],
-    ["vi9", "IVmaj7", "Imaj7", "V7"],
+    ["vi9", "IVmaj7", "Iadd9", "V"],
   ],
   dark: [
     ["i", "bVII", "bVI", "V7"],
@@ -675,12 +684,31 @@ function romanDegree(token: string) {
   return token.match(/^[b#]*([ivIV]+)/)?.[1].toUpperCase() ?? "";
 }
 
-export function suggestNextRomans(lastRoman: string): NextRomanSuggestion[] {
+function isDominantLike(token: string) {
+  const degree = romanDegree(token);
+  return degree === "V" || /(^|[b#])(?:II|III|VI)7/.test(token);
+}
+
+function dedupeSuggestions(suggestions: NextRomanSuggestion[]) {
+  const seen = new Set<string>();
+  return suggestions.filter((suggestion) => {
+    if (seen.has(suggestion.token)) return false;
+    seen.add(suggestion.token);
+    return true;
+  });
+}
+
+export function suggestNextRomans(
+  lastRoman: string,
+  contextRomans: string[] = [],
+  mode: KeySig["mode"] = "major"
+): NextRomanSuggestion[] {
   const match = lastRoman.match(/[b#]*[ivIV]+/);
   if (!match) return NEXT_BY_DEGREE.I;
 
   const accidental = match[0].match(/^[b#]+/)?.[0] ?? "";
   const degree = match[0].replace(/^[b#]+/, "").toUpperCase();
+  const phrasePos = contextRomans.length % 4;
 
   if (accidental === "b" && degree === "VII") {
     return [
@@ -690,13 +718,48 @@ export function suggestNextRomans(lastRoman: string): NextRomanSuggestion[] {
     ];
   }
 
-  return NEXT_BY_DEGREE[degree] ?? NEXT_BY_DEGREE.I;
+  if (degree === "V" && !accidental) {
+    return mode === "minor"
+      ? [
+          { token: "i", label: "resolve" },
+          { token: "i7", label: "dark" },
+          { token: "bVI", label: "cinema" },
+          { token: "iv", label: "loop" },
+          { token: "i9", label: "neo" },
+        ]
+      : [
+          { token: "I", label: "resolve" },
+          { token: "Imaj7", label: "soft" },
+          { token: "vi", label: "deceptive" },
+          { token: "IV", label: "loop" },
+          { token: "Iadd9", label: "open" },
+        ];
+  }
+
+  const base = [...(NEXT_BY_DEGREE[degree] ?? NEXT_BY_DEGREE.I)];
+
+  if (phrasePos === 3 && !isDominantLike(lastRoman)) {
+    base.unshift(
+      { token: "V", label: "turn" },
+      { token: "V7", label: "cadence" }
+    );
+  }
+
+  if (phrasePos === 0 && contextRomans.length >= 4) {
+    base.push(
+      { token: "I", label: "reset" },
+      { token: mode === "minor" ? "i9" : "Iadd9", label: "air" }
+    );
+  }
+
+  return dedupeSuggestions(base).slice(0, 5);
 }
 
 export function generateSectionRomans(
   shape: SectionShapeId,
   bars: number,
-  lastRoman = ""
+  lastRoman = "",
+  mode: KeySig["mode"] = "major"
 ) {
   const length = normalizeBars(bars);
 
@@ -708,7 +771,7 @@ export function generateSectionRomans(
   let current = lastRoman || "I";
 
   for (let idx = 0; idx < length; idx++) {
-    const options = suggestNextRomans(current);
+    const options = suggestNextRomans(current, romans, mode);
     const weighted =
       idx === length - 2
         ? options.filter((option) => romanDegree(option.token) === "V")
@@ -729,7 +792,7 @@ export function generateSectionChords(
   key: KeySig,
   lastRoman = ""
 ) {
-  return generateSectionRomans(shape, bars, lastRoman).map((token) =>
+  return generateSectionRomans(shape, bars, lastRoman, key.mode).map((token) =>
     romanTokenToChord(token, key)
   );
 }
