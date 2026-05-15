@@ -1,17 +1,12 @@
 // lib/chordGuide.ts
-import { Chord } from "tonal";
 import { toFlatPc } from "./chordSuggest";
+import { getChordToneGroups } from "./voicing";
 
 export type ChordGuideOptions = {
   add9?: boolean;
   add11?: boolean;
   add13?: boolean;
 };
-
-function coreSymbol(symbol: string) {
-  // "F/G" -> "F"
-  return symbol.trim().split("/")[0].trim();
-}
 
 function uniq(list: string[]) {
   return Array.from(new Set(list.filter(Boolean)));
@@ -28,17 +23,12 @@ export function getChordGuidePcs(
   chordSymbol: string,
   opts: ChordGuideOptions = {}
 ) {
-  const c = Chord.get(coreSymbol(chordSymbol));
-  if (!c?.tonic) return { chordPcs: [] as string[], extPcs: [] as string[] };
-
-  const notes = (c.notes ?? []).map(toFlatPc);
-
-  const chordPcs = uniq([notes[0], notes[1], notes[2], notes[3]]);
-
+  const groups = getChordToneGroups(chordSymbol);
+  const chordPcs = uniq(groups.chordPcs.map(toFlatPc));
   const ext: string[] = [];
-  if (opts.add9 && notes[4]) ext.push(notes[4]);
-  if (opts.add11 && notes[5]) ext.push(notes[5]);
-  if (opts.add13 && notes[6]) ext.push(notes[6]);
+  if (opts.add9 && groups.ninthPc) ext.push(toFlatPc(groups.ninthPc));
+  if (opts.add11 && groups.eleventhPc) ext.push(toFlatPc(groups.eleventhPc));
+  if (opts.add13 && groups.thirteenthPc) ext.push(toFlatPc(groups.thirteenthPc));
 
   const chordSet = new Set(chordPcs);
   const extPcs = uniq(ext).filter((pc) => !chordSet.has(pc));

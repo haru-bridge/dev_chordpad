@@ -2,17 +2,48 @@
 "use client";
 
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import * as Tone from "tone";
+import type { PolySynth, ToneAudioNode } from "tone";
 import {
   buildPadVoicing,
+  describeChordToneSummary,
   PadVoicingPreset,
   PAD_PRESETS,
+  normalizePadRange,
   romanizeChord,
   type KeySig,
   signedSemitoneDiff,
+  smoothVoiceLead,
   type OmitFlags,
 } from "../lib/voicing";
 import { PianoKeyboard } from "../app/PianoKeyboard";
+import {
+  INSTRUMENT_PRESETS,
+  instrumentLabel,
+  type InstrumentId,
+} from "../lib/instruments";
+import { midiFromPc, midiToNoteName } from "../lib/musicNote";
+import {
+  matchesProgressionMood,
+  PROGRESSION_CATEGORIES,
+  PROGRESSION_MOODS,
+  PROGRESSION_PRESETS,
+  SECTION_SHAPES,
+  generateSectionChords,
+  progressionMoods,
+  progressionToChords,
+  romanTokenToChord,
+  suggestNextRomans,
+  type ProgressionCategory,
+  type ProgressionMood,
+  type ProgressionPreset,
+  type SectionShapeId,
+} from "../lib/progressions";
+import {
+  CHORD_TRANSFORMS,
+  transformChordSymbols,
+  type ChordTransformId,
+} from "../lib/chordActions";
+import { buildChordMidiFile } from "../lib/midiExport";
 
 import {
   buildNoteEvents,
@@ -28,6 +59,7 @@ type LogRow = {
   chord: string;
   roman?: string;
   preset: PadVoicingPreset;
+  instrument: InstrumentId;
   notes: string[];
   midis: number[];
   shift: number;
@@ -35,6 +67,26 @@ type LogRow = {
 };
 
 const MAX_PADS = 16;
+const PAD_KEY_LAYOUT = [
+  "1",
+  "2",
+  "3",
+  "4",
+  "q",
+  "w",
+  "e",
+  "r",
+  "a",
+  "s",
+  "d",
+  "f",
+  "z",
+  "x",
+  "c",
+  "v",
+] as const;
+const STORAGE_KEY = "chordpad.settings.v2";
+const DEFAULT_CENTER_OCTAVE = 5;
 
 const KEY_ROOTS = [
   "C",
@@ -53,6 +105,7 @@ const KEY_ROOTS = [
 
 type KeyRoot = (typeof KEY_ROOTS)[number];
 type KeyMode = "major" | "minor";
+type ProgressionCategoryFilter = ProgressionCategory | "All";
 
 function nowStr() {
   return new Date().toLocaleTimeString();
@@ -60,7 +113,17 @@ function nowStr() {
 
 type HoldState = {
   notes: string[];
-  scheduleIds: number[]; // Tone.Transport.scheduleOnce ids
+};
+
+type ToneModule = typeof import("tone");
+
+type AudioNodeRef = ToneAudioNode;
+type AudioSynthRef = PolySynth;
+
+type NoteHoldState = {
+  count: number;
+  attackId: number | null;
+  sounding: boolean;
 };
 
 export default function Page() {
@@ -74,11 +137,25 @@ export default function Page() {
   const [playMode, setPlayMode] = useState<KeyMode>("major");
 
   // --- voicing ---
-  const [centerOctave, setCenterOctave] = useState(5);
+  const [centerOctave, setCenterOctave] = useState(DEFAULT_CENTER_OCTAVE);
+  const [voiceLead, setVoiceLead] = useState(true);
+
+  // --- sound ---
+  const [instrument, setInstrument] = useState<InstrumentId>("soft_keys");
+  const [latchMode, setLatchMode] = useState(false);
+  const [sustainDown, setSustainDown] = useState(false);
+  const [progressionCategory, setProgressionCategory] =
+    useState<ProgressionCategoryFilter>("All");
+  const [progressionMood, setProgressionMood] =
+    useState<ProgressionMood>("All");
+  const [progressionSearch, setProgressionSearch] = useState("");
+  const [sectionBars, setSectionBars] = useState(8);
+  const [sectionShape, setSectionShape] = useState<SectionShapeId>("story");
+  const [shareStatus, setShareStatus] = useState("");
 
   // --- per pad preset ---
   const [padPresets, setPadPresets] = useState<PadVoicingPreset[]>(() =>
-    Array.from({ length: MAX_PADS }, () => "PAD_TRIAD_BASS_35R")
+    Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS")
   );
 
   const [padOmits, setPadOmits] = useState<OmitFlags[]>(() =>
@@ -118,12 +195,20 @@ export default function Page() {
   const [logs, setLogs] = useState<LogRow[]>([]);
 
   // --- audio refs ---
-  const synthRef = useRef<Tone.PolySynth | null>(null);
-  const limiterRef = useRef<Tone.Limiter | null>(null);
+  const toneRef = useRef<ToneModule | null>(null);
+  const synthRef = useRef<AudioSynthRef | null>(null);
+  const limiterRef = useRef<AudioNodeRef | null>(null);
+  const fxRefs = useRef<AudioNodeRef[]>([]);
   const audioReadyRef = useRef(false);
 
   // hold state (multi-press allowed): cancelable schedule per pad idx
   const activeHoldRef = useRef<Record<number, HoldState>>({});
+  const noteHoldsRef = useRef<Record<string, NoteHoldState>>({});
+  const sustainedPadsRef = useRef<Set<number>>(new Set());
+  const latchModeRef = useRef(latchMode);
+  const sustainDownRef = useRef(sustainDown);
+  const instrumentRef = useRef(instrument);
+  const [activePadIndices, setActivePadIndices] = useState<number[]>([]);
 
   // -------------------------
   // Keyboard visualizer state
@@ -165,6 +250,7 @@ export default function Page() {
   // Dock UI state
   // -------------------------
   const [dockOpen, setDockOpen] = useState(true);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   const analysisKey: KeySig = useMemo(
     () => ({ tonic: analysisRoot, mode: analysisMode }),
@@ -190,9 +276,11 @@ export default function Page() {
   }, [text]);
 
   const padModels = useMemo(() => {
+    let prevMidis: number[] = [];
+
     return Array.from({ length: MAX_PADS }, (_, i) => {
       const chord = chordSymbols[i] ?? "";
-      const preset = padPresets[i] ?? "PAD_TRIAD_BASS_35R";
+      const preset = padPresets[i] ?? "AUTO_VOICE_BASS";
       const omit = padOmits[i] ?? {};
 
       if (!chord) {
@@ -205,10 +293,16 @@ export default function Page() {
           midis: [] as number[],
           ok: false,
           omit,
+          toneSummary: "",
         };
       }
 
       const v = buildPadVoicing(chord, centerOctave, preset, shift, { omit });
+      const toneSummary = describeChordToneSummary(chord);
+      const rawMidis =
+        voiceLead && v ? smoothVoiceLead(prevMidis, v.midis) : v?.midis ?? [];
+      const ledMidis = normalizePadRange(rawMidis, centerOctave);
+      if (ledMidis.length) prevMidis = ledMidis;
       const roman = romanizeChord(chord, analysisKey);
 
       return {
@@ -216,13 +310,22 @@ export default function Page() {
         chord,
         roman,
         preset,
-        notes: v?.notes ?? [],
-        midis: v?.midis ?? [],
+        notes: ledMidis.map(midiToNoteName),
+        midis: ledMidis,
         ok: Boolean(v),
         omit,
+        toneSummary,
       };
     });
-  }, [chordSymbols, padPresets, padOmits, centerOctave, shift, analysisKey]);
+  }, [
+    chordSymbols,
+    padPresets,
+    padOmits,
+    centerOctave,
+    shift,
+    analysisKey,
+    voiceLead,
+  ]);
 
   // keep latest models/perf/shift in refs for stable event handlers
   const padModelsRef = useRef(padModels);
@@ -238,6 +341,186 @@ export default function Page() {
   useEffect(() => {
     shiftRef.current = shift;
   }, [shift]);
+  useEffect(() => {
+    latchModeRef.current = latchMode;
+  }, [latchMode]);
+  useEffect(() => {
+    sustainDownRef.current = sustainDown;
+  }, [sustainDown]);
+  useEffect(() => {
+    instrumentRef.current = instrument;
+  }, [instrument]);
+
+  const syncActivePads = () => {
+    setActivePadIndices(
+      Object.keys(activeHoldRef.current)
+        .map(Number)
+        .sort((a, b) => a - b)
+    );
+  };
+
+  useEffect(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const sharedText = params.get("c");
+
+      if (sharedText) {
+        setText(sharedText);
+        if (KEY_ROOTS.includes(params.get("ak") as KeyRoot)) {
+          setAnalysisRoot(params.get("ak") as KeyRoot);
+        }
+        if (params.get("am") === "major" || params.get("am") === "minor") {
+          setAnalysisMode(params.get("am") as KeyMode);
+        }
+        if (KEY_ROOTS.includes(params.get("pk") as KeyRoot)) {
+          setPlayRoot(params.get("pk") as KeyRoot);
+        }
+        if (params.get("pm") === "major" || params.get("pm") === "minor") {
+          setPlayMode(params.get("pm") as KeyMode);
+        }
+        const oct = Number(params.get("oct"));
+        if (Number.isFinite(oct)) setCenterOctave(Math.max(4, Math.min(6, oct)));
+        if (params.get("vl") === "0") setVoiceLead(false);
+        if (INSTRUMENT_PRESETS.some((preset) => preset.id === params.get("inst"))) {
+          setInstrument(params.get("inst") as InstrumentId);
+        }
+        return;
+      }
+
+      const raw = window.localStorage.getItem(STORAGE_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw) as Record<string, unknown>;
+
+      if (typeof saved.text === "string") setText(saved.text);
+      if (KEY_ROOTS.includes(saved.analysisRoot as KeyRoot)) {
+        setAnalysisRoot(saved.analysisRoot as KeyRoot);
+      }
+      if (saved.analysisMode === "major" || saved.analysisMode === "minor") {
+        setAnalysisMode(saved.analysisMode);
+      }
+      if (KEY_ROOTS.includes(saved.playRoot as KeyRoot)) {
+        setPlayRoot(saved.playRoot as KeyRoot);
+      }
+      if (saved.playMode === "major" || saved.playMode === "minor") {
+        setPlayMode(saved.playMode);
+      }
+      if (typeof saved.centerOctave === "number") {
+        setCenterOctave(Math.max(4, Math.min(6, saved.centerOctave)));
+      }
+      if (typeof saved.voiceLead === "boolean") setVoiceLead(saved.voiceLead);
+      if (
+        INSTRUMENT_PRESETS.some((preset) => preset.id === saved.instrument)
+      ) {
+        setInstrument(saved.instrument as InstrumentId);
+      }
+      if (typeof saved.latchMode === "boolean") {
+        setLatchMode(saved.latchMode);
+      }
+      if (
+        saved.progressionCategory === "All" ||
+        PROGRESSION_CATEGORIES.includes(saved.progressionCategory as ProgressionCategory)
+      ) {
+        setProgressionCategory(saved.progressionCategory as ProgressionCategoryFilter);
+      }
+      if (PROGRESSION_MOODS.includes(saved.progressionMood as ProgressionMood)) {
+        setProgressionMood(saved.progressionMood as ProgressionMood);
+      }
+      if (typeof saved.progressionSearch === "string") {
+        setProgressionSearch(saved.progressionSearch);
+      }
+      if (typeof saved.sectionBars === "number") {
+        const bars = [4, 8, 12, 16].includes(saved.sectionBars)
+          ? saved.sectionBars
+          : 8;
+        setSectionBars(bars);
+      }
+      if (SECTION_SHAPES.some((shape) => shape.id === saved.sectionShape)) {
+        setSectionShape(saved.sectionShape as SectionShapeId);
+      }
+      const savedPadPresets = saved.padPresets;
+      if (Array.isArray(savedPadPresets)) {
+        setPadPresets(
+          Array.from({ length: MAX_PADS }, (_, idx) => {
+            const candidate = savedPadPresets[idx];
+            return PAD_PRESETS.some((preset) => preset.id === candidate)
+              ? (candidate as PadVoicingPreset)
+              : "AUTO_VOICE_BASS";
+          })
+        );
+      }
+      const savedPadOmits = saved.padOmits;
+      if (Array.isArray(savedPadOmits)) {
+        setPadOmits(
+          Array.from({ length: MAX_PADS }, (_, idx) => {
+            const candidate = savedPadOmits[idx] as OmitFlags | undefined;
+            return {
+              root: !!candidate?.root,
+              third: !!candidate?.third,
+              fifth: !!candidate?.fifth,
+              seventh: !!candidate?.seventh,
+            };
+          })
+        );
+      }
+      if (saved.perf && typeof saved.perf === "object") {
+        setPerf((prev) => ({
+          ...prev,
+          ...(saved.perf as Partial<PerformanceSettings>),
+        }));
+      }
+    } finally {
+      setSettingsLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    const timer = window.setTimeout(() => {
+      window.localStorage.setItem(
+        STORAGE_KEY,
+        JSON.stringify({
+          text,
+          analysisRoot,
+          analysisMode,
+          playRoot,
+          playMode,
+          centerOctave,
+          voiceLead,
+          instrument,
+          latchMode,
+          progressionCategory,
+          progressionMood,
+          progressionSearch,
+          sectionBars,
+          sectionShape,
+          padPresets,
+          padOmits,
+          perf,
+        })
+      );
+    }, 180);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    settingsLoaded,
+    text,
+    analysisRoot,
+    analysisMode,
+    playRoot,
+    playMode,
+    centerOctave,
+    voiceLead,
+    instrument,
+    latchMode,
+    progressionCategory,
+    progressionMood,
+    progressionSearch,
+    sectionBars,
+    sectionShape,
+    padPresets,
+    padOmits,
+    perf,
+  ]);
 
   const romanProgression = useMemo(() => {
     const romans = chordSymbols
@@ -246,26 +529,274 @@ export default function Page() {
     return romans.join("  ");
   }, [chordSymbols, analysisKey]);
 
-  const ensureSynth = () => {
+  const visibleProgressions = useMemo(
+    () => {
+      const query = progressionSearch.trim().toLowerCase();
+
+      return PROGRESSION_PRESETS.filter((preset) => {
+        if (
+          progressionCategory !== "All" &&
+          preset.category !== progressionCategory
+        ) {
+          return false;
+        }
+        if (!matchesProgressionMood(preset, progressionMood)) return false;
+        if (!query) return true;
+
+        const haystack = [
+          preset.category,
+          preset.name,
+          preset.alias,
+          preset.feel,
+          ...progressionMoods(preset),
+        ]
+          .join(" ")
+          .toLowerCase();
+        return haystack.includes(query);
+      });
+    },
+    [progressionCategory, progressionMood, progressionSearch]
+  );
+
+  const applyProgression = (preset: ProgressionPreset) => {
+    const next = progressionToChords(preset, analysisKey).slice(0, MAX_PADS);
+    setText(next.join(" "));
+    setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
+  };
+
+  const appendProgression = (preset: ProgressionPreset) => {
+    const next = progressionToChords(preset, analysisKey);
+    setText((prev) => {
+      const merged = [...prev.split(/[\s,]+/).filter(Boolean), ...next].slice(
+        0,
+        MAX_PADS
+      );
+      return merged.join(" ");
+    });
+  };
+
+  const applyRandomProgression = () => {
+    const source = visibleProgressions.length
+      ? visibleProgressions
+      : PROGRESSION_PRESETS;
+    const preset = source[Math.floor(Math.random() * source.length)];
+    if (preset) applyProgression(preset);
+  };
+
+  const transformCurrentChords = (transform: ChordTransformId) => {
+    if (!chordSymbols.length) return;
+    setText(transformChordSymbols(chordSymbols, transform).join(" "));
+    setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
+  };
+
+  const lastRoman = useMemo(() => {
+    const lastChord = chordSymbols[chordSymbols.length - 1];
+    return lastChord ? romanizeChord(lastChord, analysisKey) : "";
+  }, [chordSymbols, analysisKey]);
+
+  const nextChordSuggestions = useMemo(() => {
+    return suggestNextRomans(lastRoman).map((suggestion) => ({
+      ...suggestion,
+      chord: romanTokenToChord(suggestion.token, analysisKey),
+    }));
+  }, [lastRoman, analysisKey]);
+
+  const appendNextChord = (chord: string) => {
+    setText((prev) => {
+      const merged = [...prev.split(/[\s,]+/).filter(Boolean), chord].slice(
+        0,
+        MAX_PADS
+      );
+      return merged.join(" ");
+    });
+  };
+
+  const makeSectionChords = (mode: "replace" | "append") =>
+    generateSectionChords(
+      sectionShape,
+      sectionBars,
+      analysisKey,
+      mode === "append" ? lastRoman : ""
+    ).slice(0, MAX_PADS);
+
+  const replaceWithSection = () => {
+    setText(makeSectionChords("replace").join(" "));
+    setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
+  };
+
+  const appendSection = () => {
+    const next = makeSectionChords("append");
+    setText((prev) => {
+      const merged = [...prev.split(/[\s,]+/).filter(Boolean), ...next].slice(
+        0,
+        MAX_PADS
+      );
+      return merged.join(" ");
+    });
+  };
+
+  const copyShareUrl = async () => {
+    const url = new URL(window.location.href);
+    url.search = "";
+    url.searchParams.set("c", text);
+    url.searchParams.set("ak", analysisRoot);
+    url.searchParams.set("am", analysisMode);
+    url.searchParams.set("pk", playRoot);
+    url.searchParams.set("pm", playMode);
+    url.searchParams.set("oct", String(centerOctave));
+    url.searchParams.set("inst", instrument);
+    url.searchParams.set("vl", voiceLead ? "1" : "0");
+
+    try {
+      await navigator.clipboard.writeText(url.toString());
+      setShareStatus("copied");
+    } catch {
+      setShareStatus("copy failed");
+    }
+
+    window.setTimeout(() => setShareStatus(""), 1400);
+  };
+
+  const exportMidi = () => {
+    const chords = padModels
+      .filter((pad) => pad.ok && pad.midis.length)
+      .map((pad) => ({ name: pad.chord, midis: pad.midis }));
+    if (!chords.length) return;
+
+    const file = buildChordMidiFile(chords, {
+      bpm: 108,
+      ticksPerChord: 960,
+      strumTicks: Math.max(0, Math.round(perf.strumMs / 3)),
+    });
+    const blob = new Blob([file], { type: "audio/midi" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `chordpad-${Date.now()}.mid`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const loadTone = async () => {
+    if (!toneRef.current) {
+      toneRef.current = await import("tone");
+    }
+    return toneRef.current;
+  };
+
+  const disposeAudioGraph = () => {
+    synthRef.current?.dispose?.();
+    limiterRef.current?.dispose?.();
+    fxRefs.current.forEach((fx) => fx?.dispose?.());
+    synthRef.current = null;
+    limiterRef.current = null;
+    fxRefs.current = [];
+  };
+
+  const ensureSynth = async () => {
     if (synthRef.current) return synthRef.current;
 
-    const limiter = new Tone.Limiter(-12).toDestination();
+    const Tone = await loadTone();
+    const limiter = new Tone.Limiter(-10).toDestination();
     limiterRef.current = limiter;
 
-    const synth = new Tone.PolySynth(Tone.Synth, {
-      oscillator: { type: "sine" },
-      envelope: { attack: 0.01, decay: 0.08, sustain: 0.75, release: 0.28 },
-    }).connect(limiter);
+    const addFx = <T extends AudioNodeRef>(fx: T) => {
+      fxRefs.current.push(fx);
+      return fx;
+    };
 
-    synth.volume.value = -16;
+    let synth: AudioSynthRef;
+    const id = instrumentRef.current;
+
+    if (id === "warm_pad") {
+      const chorus = addFx(new Tone.Chorus(0.7, 2.1, 0.28));
+      chorus.start?.();
+      const filter = addFx(new Tone.Filter(3600, "lowpass")).connect(limiter);
+      chorus.connect(filter);
+      synth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: "triangle" },
+        envelope: { attack: 0.18, decay: 0.18, sustain: 0.78, release: 1.4 },
+      }).connect(chorus);
+      synth.volume.value = -18;
+    } else if (id === "glass_fm") {
+      const delay = addFx(new Tone.FeedbackDelay("16n", 0.12));
+      delay.wet.value = 0.16;
+      const filter = addFx(new Tone.Filter(6200, "lowpass")).connect(limiter);
+      delay.connect(filter);
+      synth = new Tone.PolySynth(Tone.FMSynth, {
+        harmonicity: 1.52,
+        modulationIndex: 2.8,
+        envelope: { attack: 0.012, decay: 0.34, sustain: 0.22, release: 0.95 },
+        modulationEnvelope: {
+          attack: 0.006,
+          decay: 0.22,
+          sustain: 0.03,
+          release: 0.5,
+        },
+      }).connect(delay);
+      synth.volume.value = -18;
+    } else if (id === "pluck") {
+      synth = new Tone.PolySynth(Tone.MonoSynth, {
+        oscillator: { type: "sawtooth" },
+        filter: { Q: 1.2, type: "lowpass", rolloff: -24 },
+        envelope: { attack: 0.002, decay: 0.16, sustain: 0.02, release: 0.18 },
+        filterEnvelope: {
+          attack: 0.001,
+          decay: 0.14,
+          sustain: 0.08,
+          release: 0.12,
+          baseFrequency: 520,
+          octaves: 3.4,
+        },
+      }).connect(limiter);
+      synth.volume.value = -16;
+    } else if (id === "organ") {
+      const filter = addFx(new Tone.Filter(3000, "lowpass")).connect(limiter);
+      synth = new Tone.PolySynth(Tone.AMSynth, {
+        harmonicity: 1.995,
+        oscillator: { type: "sine" },
+        envelope: { attack: 0.01, decay: 0.08, sustain: 0.82, release: 0.12 },
+        modulation: { type: "square" },
+        modulationEnvelope: {
+          attack: 0.01,
+          decay: 0.03,
+          sustain: 0.72,
+          release: 0.08,
+        },
+      }).connect(filter);
+      synth.volume.value = -21;
+    } else if (id === "chip_8bit") {
+      const crusher = addFx(new Tone.BitCrusher({ bits: 5 })).connect(limiter);
+      synth = new Tone.PolySynth(Tone.Synth, {
+        oscillator: { type: "square" },
+        envelope: { attack: 0.002, decay: 0.055, sustain: 0.42, release: 0.075 },
+      }).connect(crusher);
+      synth.volume.value = -18;
+    } else {
+      const filter = addFx(new Tone.Filter(4400, "lowpass")).connect(limiter);
+      synth = new Tone.PolySynth(Tone.FMSynth, {
+        harmonicity: 1.45,
+        modulationIndex: 2.2,
+        envelope: { attack: 0.012, decay: 0.18, sustain: 0.52, release: 0.52 },
+        modulationEnvelope: {
+          attack: 0.006,
+          decay: 0.14,
+          sustain: 0.18,
+          release: 0.34,
+        },
+      }).connect(filter);
+      synth.volume.value = -17;
+    }
+
     synthRef.current = synth;
     return synth;
   };
 
   const ensureAudioReady = async () => {
     // Always try to resume on user gesture (iOS can suspend)
+    const Tone = await loadTone();
     await Tone.start();
-    ensureSynth();
+    await ensureSynth();
 
     if (Tone.Transport.state !== "started") {
       // Needed for scheduleOnce callbacks to fire
@@ -288,18 +819,37 @@ export default function Page() {
     oneShotMidisRef.current = [];
   };
 
-  const stopHoldByIndex = (idx: number) => {
+  const releaseNoteOwner = (note: string) => {
+    const state = noteHoldsRef.current[note];
+    if (!state) return;
+
+    state.count -= 1;
+    if (state.count > 0) return;
+
+    const Tone = toneRef.current;
+    if (Tone && state.attackId !== null) {
+      Tone.Transport.clear(state.attackId);
+    }
+    if (state.sounding) {
+      synthRef.current?.triggerRelease?.(note, Tone?.now?.() ?? undefined);
+    }
+    delete noteHoldsRef.current[note];
+  };
+
+  const stopHoldByIndex = (idx: number, opts: { force?: boolean } = {}) => {
     const h = activeHoldRef.current[idx];
     if (!h) return;
 
-    // cancel scheduled attacks for this hold only
-    h.scheduleIds.forEach((id) => Tone.Transport.clear(id));
+    if (!opts.force && sustainDownRef.current) {
+      sustainedPadsRef.current.add(idx);
+      return;
+    }
 
-    const synth = synthRef.current;
-    if (synth) synth.triggerRelease(h.notes, Tone.now());
-
+    h.notes.forEach((note) => releaseNoteOwner(note));
     delete activeHoldRef.current[idx];
     delete holdMidisRef.current[idx];
+    sustainedPadsRef.current.delete(idx);
+    syncActivePads();
     requestSyncActiveMidis();
   };
 
@@ -311,7 +861,9 @@ export default function Page() {
     setGuidePadIdx(idx);
 
     await ensureAudioReady();
-    const synth = ensureSynth();
+    const Tone = toneRef.current;
+    const synth = await ensureSynth();
+    if (!Tone) return;
 
     // Visualizer: light full chord immediately (stable, cheap)
     holdMidisRef.current[idx] = p.midis;
@@ -320,22 +872,33 @@ export default function Page() {
     // schedule strum/arp attacks via Transport (cancelable, less timer jitter)
     const events = buildNoteEvents(p.notes, p.midis, perfRef.current, 0.9);
 
-    const scheduleIds: number[] = [];
     const notesToRelease: string[] = [];
 
     for (const ev of events) {
       notesToRelease.push(ev.note);
 
+      const existing = noteHoldsRef.current[ev.note];
+      if (existing) {
+        existing.count += 1;
+        continue;
+      }
+
+      const state: NoteHoldState = {
+        count: 1,
+        attackId: null,
+        sounding: false,
+      };
+      noteHoldsRef.current[ev.note] = state;
+
       const delaySec = Math.max(0, ev.delayMs) / 1000;
-      const id = Tone.Transport.scheduleOnce((time) => {
-        // Use `time` provided by Tone for sample-accurate scheduling
+      state.attackId = Tone.Transport.scheduleOnce((time) => {
+        state.sounding = true;
         synth.triggerAttack(ev.note, time, ev.velocity);
       }, `+${delaySec}`);
-
-      scheduleIds.push(id);
     }
 
-    activeHoldRef.current[idx] = { notes: notesToRelease, scheduleIds };
+    activeHoldRef.current[idx] = { notes: notesToRelease };
+    syncActivePads();
 
     // Log only at hold start (avoid spam)
     pushLog({
@@ -343,6 +906,7 @@ export default function Page() {
       chord: p.chord,
       roman: p.roman,
       preset: p.preset,
+      instrument: instrumentRef.current,
       notes: p.notes,
       midis: p.midis,
       shift: shiftRef.current,
@@ -351,17 +915,24 @@ export default function Page() {
   };
 
   const stopAll = () => {
+    const Tone = toneRef.current;
+
     // cancel everything scheduled
-    Tone.Transport.stop();
-    Tone.Transport.cancel(0);
+    if (Tone) {
+      Tone.Transport.stop();
+      Tone.Transport.cancel(0);
+    }
 
     // release any held notes
     const synth = synthRef.current;
-    if (synth) synth.releaseAll();
+    synth?.releaseAll?.();
 
     // clear holds bookkeeping
     activeHoldRef.current = {};
+    noteHoldsRef.current = {};
+    sustainedPadsRef.current.clear();
     holdMidisRef.current = {};
+    syncActivePads();
 
     // clear viz one-shot
     clearOneShotViz();
@@ -390,13 +961,17 @@ export default function Page() {
   useEffect(() => {
     return () => {
       stopAll();
-      synthRef.current?.dispose();
-      limiterRef.current?.dispose();
-      synthRef.current = null;
-      limiterRef.current = null;
+      disposeAudioGraph();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => {
+    if (!audioReadyRef.current && !synthRef.current) return;
+    stopAll();
+    disposeAudioGraph();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [instrument]);
 
   // -------------------------
   // Text window helpers
@@ -409,8 +984,143 @@ export default function Page() {
     });
   };
 
+  const padIndexForKey = (key: string) => {
+    const normalized = key.toLowerCase();
+    const idx = PAD_KEY_LAYOUT.findIndex((k) => k === normalized);
+    return idx >= 0 ? idx : null;
+  };
+
+  const releaseSustainPads = () => {
+    const pads = Array.from(sustainedPadsRef.current);
+    sustainedPadsRef.current.clear();
+    pads.forEach((idx) => stopHoldByIndex(idx, { force: true }));
+  };
+
+  const triggerPadDown = async (idx: number) => {
+    if (latchModeRef.current) {
+      if (activeHoldRef.current[idx]) {
+        stopHoldByIndex(idx, { force: true });
+      } else {
+        await startHoldByIndex(idx);
+      }
+      return;
+    }
+
+    await startHoldByIndex(idx);
+  };
+
+  const triggerPadUp = (idx: number) => {
+    if (latchModeRef.current) return;
+    stopHoldByIndex(idx);
+  };
+
+  const renderPadButton = (
+    p: (typeof padModels)[number],
+    variant: "quick" | "dock" | "detail"
+  ) => {
+    const disabled = !p.ok;
+    const active = activePadIndices.includes(p.idx);
+    const baseStyle =
+      variant === "quick"
+        ? styles.quickPad
+        : variant === "dock"
+          ? styles.dockPad
+          : styles.pad;
+    const activeStyle =
+      variant === "quick"
+        ? styles.quickPadActive
+        : variant === "dock"
+          ? styles.dockPadActive
+          : styles.padActive;
+
+    return (
+      <button
+        key={`${variant}-${p.idx}`}
+        type="button"
+        disabled={disabled}
+        aria-label={`Pad ${p.idx + 1} ${p.chord || "empty"}`}
+        onPointerDown={async (e) => {
+          e.preventDefault();
+          (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+          await triggerPadDown(p.idx);
+        }}
+        onPointerUp={(e) => {
+          e.preventDefault();
+          triggerPadUp(p.idx);
+          (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
+        }}
+        onPointerCancel={(e) => {
+          e.preventDefault();
+          triggerPadUp(p.idx);
+        }}
+        style={{
+          ...baseStyle,
+          ...(active ? activeStyle : {}),
+          opacity: disabled ? 0.42 : 1,
+          cursor: disabled ? "not-allowed" : "pointer",
+          outline:
+            guidePadIdx === p.idx
+              ? "2px solid rgba(59,130,246,0.36)"
+              : variant === "dock"
+                ? "1px solid rgba(148,163,184,0.24)"
+                : undefined,
+        }}
+        title={p.chord ? `${PAD_KEY_LAYOUT[p.idx].toUpperCase()} ${p.chord}` : ""}
+      >
+        <div
+          style={
+            variant === "detail"
+              ? styles.padTop
+              : variant === "dock"
+                ? styles.dockPadTop
+                : styles.quickPadTop
+          }
+        >
+          {variant === "detail" ? (
+            <>
+              <span>{PAD_KEY_LAYOUT[p.idx].toUpperCase()}</span>
+              <span>
+                #{p.idx + 1} {p.chord || "—"}
+              </span>
+            </>
+          ) : (
+            `${PAD_KEY_LAYOUT[p.idx].toUpperCase()} · #${p.idx + 1}`
+          )}
+        </div>
+        <div
+          style={
+            variant === "dock"
+              ? styles.dockPadChord
+              : variant === "quick"
+                ? styles.quickPadChord
+                : styles.padRoman
+          }
+        >
+          {variant === "detail" ? p.roman || " " : p.chord || "—"}
+        </div>
+        {variant === "detail" ? (
+          <>
+            <div style={styles.padToneSummary}>
+              tones: {p.toneSummary || "-"}
+            </div>
+            <div style={styles.padNotes}>
+              {p.notes.length ? p.notes.join(" ") : "（解析できません）"}
+            </div>
+            <div style={styles.mutedSmall}>
+              midis: {p.midis.length ? p.midis.join(", ") : "-"}
+            </div>
+          </>
+        ) : (
+          <div style={variant === "dock" ? styles.dockPadRoman : styles.quickPadRoman}>
+            {p.roman || " "}
+          </div>
+        )}
+      </button>
+    );
+  };
+
   // -------------------------
-  // Keyboard hold (1..9)
+  // Keyboard hold (4x4 pad layout)
   // -------------------------
   useEffect(() => {
     const onKeyDown = async (e: KeyboardEvent) => {
@@ -418,18 +1128,37 @@ export default function Page() {
       if (tag === "textarea" || tag === "input" || tag === "select") return;
       if (e.repeat) return;
 
-      const n = Number(e.key);
-      if (!Number.isFinite(n) || n < 1 || n > 9) return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        sustainDownRef.current = true;
+        setSustainDown(true);
+        return;
+      }
 
-      const idx = n - 1;
-      await startHoldByIndex(idx);
+      if (e.key.toLowerCase() === "l") {
+        setLatchMode((v) => !v);
+        return;
+      }
+
+      const idx = padIndexForKey(e.key);
+      if (idx == null) return;
+      e.preventDefault();
+      await triggerPadDown(idx);
     };
 
     const onKeyUp = (e: KeyboardEvent) => {
-      const n = Number(e.key);
-      if (!Number.isFinite(n) || n < 1 || n > 9) return;
-      const idx = n - 1;
-      stopHoldByIndex(idx);
+      if (e.code === "Space") {
+        e.preventDefault();
+        sustainDownRef.current = false;
+        setSustainDown(false);
+        releaseSustainPads();
+        return;
+      }
+
+      const idx = padIndexForKey(e.key);
+      if (idx == null) return;
+      e.preventDefault();
+      triggerPadUp(idx);
     };
 
     window.addEventListener("keydown", onKeyDown);
@@ -447,10 +1176,20 @@ export default function Page() {
   // -------------------------
   const playSingleMidi = async (midi: number) => {
     await ensureAudioReady();
-    const synth = ensureSynth();
+    const Tone = toneRef.current;
+    const synth = await ensureSynth();
+    if (!Tone) return;
 
-    const note = Tone.Frequency(midi, "midi").toNote();
+    const note = midiToNoteName(midi);
     const events = buildNoteEvents([note], [midi], perfRef.current, 0.35);
+
+    clearOneShotViz();
+    oneShotMidisRef.current = [midi];
+    oneShotTimerRef.current = window.setTimeout(() => {
+      clearOneShotViz();
+      requestSyncActiveMidis();
+    }, 260);
+    requestSyncActiveMidis();
 
     const start = Tone.now();
     events.forEach((ev) => {
@@ -469,19 +1208,19 @@ export default function Page() {
   };
 
   const kbRange = useMemo(() => {
-    const min = Tone.Frequency(`C${Math.max(1, centerOctave - 2)}`).toMidi();
-    const max = Tone.Frequency(`B${centerOctave + 2}`).toMidi();
+    const min = midiFromPc("C", Math.max(1, centerOctave - 2));
+    const max = midiFromPc("B", centerOctave + 2);
     return { min, max };
   }, [centerOctave]);
 
   const pickedInfo = useMemo(() => {
     if (pickedMidi == null) return null;
 
-    const soundingNote = Tone.Frequency(pickedMidi, "midi").toNote();
+    const soundingNote = midiToNoteName(pickedMidi);
 
     // テキスト窓は「解析側」なので -shift で戻す
     const inputMidi = pickedMidi - shift;
-    const inputNote = Tone.Frequency(inputMidi, "midi").toNote();
+    const inputNote = midiToNoteName(inputMidi);
     const inputPc = toFlatPc(inputNote);
 
     const candidates = suggestChordsFromPc(inputPc);
@@ -518,7 +1257,7 @@ export default function Page() {
     const extMidis: number[] = [];
 
     for (let m = kbRange.min; m <= kbRange.max; m++) {
-      const pc = toFlatPc(Tone.Frequency(m, "midi").toNote());
+      const pc = toFlatPc(midiToNoteName(m));
       if (chordSet.has(pc)) chordMidis.push(m);
       else if (extSet.has(pc)) extMidis.push(m);
     }
@@ -535,6 +1274,7 @@ export default function Page() {
         <button
           type="button"
           onClick={() => setDockOpen((v) => !v)}
+          aria-expanded={dockOpen}
           style={styles.dockToggle}
           title="PadDock"
         >
@@ -544,53 +1284,10 @@ export default function Page() {
         {dockOpen ? (
           <div style={styles.dockPanel}>
             <div style={styles.dockGrid}>
-              {padModels.map((p) => {
-                const disabled = !p.ok;
-                return (
-                  <button
-                    key={`dock-${p.idx}`}
-                    type="button"
-                    disabled={disabled}
-                    onPointerDown={async (e) => {
-                      e.preventDefault();
-                      (e.currentTarget as HTMLElement).setPointerCapture?.(
-                        e.pointerId
-                      );
-                      await startHoldByIndex(p.idx);
-                    }}
-                    onPointerUp={(e) => {
-                      e.preventDefault();
-                      stopHoldByIndex(p.idx);
-                      (e.currentTarget as HTMLElement).releasePointerCapture?.(
-                        e.pointerId
-                      );
-                    }}
-                    onPointerCancel={(e) => {
-                      e.preventDefault();
-                      stopHoldByIndex(p.idx);
-                    }}
-                    style={{
-                      ...styles.dockPad,
-                      opacity: disabled ? 0.35 : 1,
-                      cursor: disabled ? "not-allowed" : "pointer",
-                      outline:
-                        guidePadIdx === p.idx
-                          ? "2px solid rgba(147,197,253,0.55)"
-                          : "1px solid rgba(148,163,184,0.18)",
-                    }}
-                    title={
-                      p.chord ? `#${p.idx + 1} ${p.chord}` : `#${p.idx + 1}`
-                    }
-                  >
-                    <div style={styles.dockPadTop}>#{p.idx + 1}</div>
-                    <div style={styles.dockPadChord}>{p.chord || "—"}</div>
-                    <div style={styles.dockPadRoman}>{p.roman || " "}</div>
-                  </button>
-                );
-              })}
+              {padModels.map((p) => renderPadButton(p, "dock"))}
             </div>
             <div style={styles.dockHint}>
-              押している間鳴る（同時押しOK） / 離すと止まる
+              4x4 keys: 1-4 / Q-R / A-F / Z-V · Space sustain · L latch
             </div>
           </div>
         ) : null}
@@ -606,7 +1303,115 @@ export default function Page() {
       <Dock />
 
       <div style={styles.card}>
-        <h1 style={styles.h1}>Tone.js Pad Voicing Test</h1>
+        <header style={styles.appHeader}>
+          <div>
+            <h1 style={styles.h1}>ChordPad</h1>
+            <div style={styles.headerMeta}>
+              {instrumentLabel(instrument)} / {voiceLead ? "voice lead" : "fixed"} /{" "}
+              {activePadIndices.length} active
+            </div>
+          </div>
+
+          <div style={styles.headerControls}>
+            <div style={styles.controlGroup}>
+              <div style={styles.mutedSmall}>Instrument</div>
+              <select
+                value={instrument}
+                onChange={(e) => setInstrument(e.target.value as InstrumentId)}
+                style={styles.select}
+              >
+                {INSTRUMENT_PRESETS.map((preset) => (
+                  <option key={preset.id} value={preset.id}>
+                    {preset.label} · {preset.character}
+                  </option>
+                ))}
+              </select>
+              <div style={styles.instrumentStrip}>
+                {INSTRUMENT_PRESETS.map((preset) => {
+                  const selected = preset.id === instrument;
+                  return (
+                    <button
+                      key={preset.id}
+                      type="button"
+                      onClick={() => setInstrument(preset.id)}
+                      aria-pressed={selected}
+                      style={{
+                        ...styles.instrumentChip,
+                        ...(selected ? styles.instrumentChipOn : {}),
+                      }}
+                      title={preset.character}
+                    >
+                      {preset.shortLabel}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={copyShareUrl}
+              style={styles.modeButton}
+              title="Copy share URL"
+            >
+              {shareStatus || "Share"}
+            </button>
+
+            <button
+              type="button"
+              onClick={exportMidi}
+              style={styles.modeButton}
+              title="Download MIDI"
+            >
+              MIDI
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setLatchMode((v) => !v)}
+              aria-pressed={latchMode}
+              style={{
+                ...styles.modeButton,
+                ...(latchMode ? styles.modeButtonOn : {}),
+              }}
+              title="L key"
+            >
+              Latch
+            </button>
+
+            <button
+              type="button"
+              aria-pressed={sustainDown}
+              onPointerDown={(e) => {
+                e.preventDefault();
+                sustainDownRef.current = true;
+                setSustainDown(true);
+              }}
+              onPointerUp={(e) => {
+                e.preventDefault();
+                sustainDownRef.current = false;
+                setSustainDown(false);
+                releaseSustainPads();
+              }}
+              onPointerCancel={() => {
+                sustainDownRef.current = false;
+                setSustainDown(false);
+                releaseSustainPads();
+              }}
+              style={{
+                ...styles.modeButton,
+                ...(sustainDown ? styles.modeButtonOn : {}),
+              }}
+              title="Hold Space"
+            >
+              Sustain
+            </button>
+
+            <button onClick={stopAll} style={styles.btnDanger} type="button">
+              Stop
+            </button>
+          </div>
+        </header>
 
         <section style={styles.section}>
           <div style={styles.label}>
@@ -619,6 +1424,173 @@ export default function Page() {
             style={styles.textarea}
             placeholder="例: Dbm7 C7 Fm7 Bb7 ..."
           />
+
+          <div style={styles.actionRow}>
+            {CHORD_TRANSFORMS.map((action) => (
+              <button
+                key={action.id}
+                type="button"
+                onClick={() => transformCurrentChords(action.id)}
+                style={styles.pillButton}
+              >
+                {action.label}
+              </button>
+            ))}
+            <div style={styles.actionSpacer} />
+            {nextChordSuggestions.map((suggestion) => (
+              <button
+                key={`${suggestion.token}-${suggestion.chord}`}
+                type="button"
+                onClick={() => appendNextChord(suggestion.chord)}
+                style={styles.nextButton}
+                title={suggestion.label}
+              >
+                + {suggestion.chord}
+                <span style={styles.nextTag}>{suggestion.label}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section style={styles.section}>
+          <div style={styles.sectionBuilder}>
+            <div>
+              <div style={styles.label}>Section builder</div>
+              <div style={styles.sectionMeta}>
+                {sectionBars} bars / {SECTION_SHAPES.find((shape) => shape.id === sectionShape)?.label}
+              </div>
+            </div>
+
+            <div style={styles.sectionControls}>
+              <select
+                value={sectionBars}
+                onChange={(e) => setSectionBars(Number(e.target.value))}
+                style={{ ...styles.select, width: 92 }}
+              >
+                {[4, 8, 12, 16].map((bars) => (
+                  <option key={bars} value={bars}>
+                    {bars} bars
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={sectionShape}
+                onChange={(e) => setSectionShape(e.target.value as SectionShapeId)}
+                style={{ ...styles.select, width: 132 }}
+              >
+                {SECTION_SHAPES.map((shape) => (
+                  <option key={shape.id} value={shape.id}>
+                    {shape.label}
+                  </option>
+                ))}
+              </select>
+
+              <button
+                type="button"
+                onClick={replaceWithSection}
+                style={styles.modeButton}
+              >
+                Replace
+              </button>
+
+              <button
+                type="button"
+                onClick={appendSection}
+                style={styles.modeButton}
+              >
+                Append
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section style={styles.section}>
+          <div style={styles.progressionHead}>
+            <div>
+              <div style={styles.label}>Progression presets</div>
+              <div style={styles.mutedSmall}>
+                解析キーを基準にコードへ変換します。クリックで置き換え、+で追加。
+              </div>
+            </div>
+            <div style={styles.progressionControls}>
+              <select
+                value={progressionCategory}
+                onChange={(e) =>
+                  setProgressionCategory(
+                    e.target.value as ProgressionCategoryFilter
+                  )
+                }
+                style={{ ...styles.select, width: 120 }}
+              >
+                {(["All", ...PROGRESSION_CATEGORIES] as const).map(
+                  (category) => (
+                    <option key={category} value={category}>
+                      {category}
+                    </option>
+                  )
+                )}
+              </select>
+              <select
+                value={progressionMood}
+                onChange={(e) => setProgressionMood(e.target.value as ProgressionMood)}
+                style={{ ...styles.select, width: 120 }}
+              >
+                {PROGRESSION_MOODS.map((mood) => (
+                  <option key={mood} value={mood}>
+                    {mood}
+                  </option>
+                ))}
+              </select>
+              <input
+                value={progressionSearch}
+                onChange={(e) => setProgressionSearch(e.target.value)}
+                style={styles.searchInput}
+                placeholder="search"
+              />
+              <button
+                type="button"
+                onClick={applyRandomProgression}
+                style={styles.modeButton}
+              >
+                Random
+              </button>
+            </div>
+          </div>
+
+          <div style={styles.progressionGrid}>
+            {visibleProgressions.map((preset) => {
+              const chords = progressionToChords(preset, analysisKey).join(" ");
+              return (
+                <div key={preset.id} style={styles.progressionItem}>
+                  <button
+                    type="button"
+                    onClick={() => applyProgression(preset)}
+                    style={styles.progressionMain}
+                    title={chords}
+                  >
+                    <span style={styles.progressionName}>{preset.name}</span>
+                    <span style={styles.progressionAlias}>{preset.alias}</span>
+                    <span style={styles.progressionChords}>{chords}</span>
+                    <span style={styles.progressionTags}>
+                      {progressionMoods(preset).slice(0, 3).join(" / ")}
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => appendProgression(preset)}
+                    style={styles.progressionAppend}
+                    title="Append to chord list"
+                  >
+                    +
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+          {visibleProgressions.length === 0 ? (
+            <div style={styles.emptyHint}>No matching presets</div>
+          ) : null}
         </section>
 
         <section style={styles.sectionRow}>
@@ -676,7 +1648,7 @@ export default function Page() {
             <div style={styles.label}>Center octave（手の位置）</div>
             <input
               type="range"
-              min={2}
+              min={4}
               max={6}
               value={centerOctave}
               onChange={(e) => setCenterOctave(Number(e.target.value))}
@@ -688,9 +1660,46 @@ export default function Page() {
           </div>
 
           <div style={{ display: "flex", gap: 8, alignItems: "end" }}>
-            <button onClick={stopAll} style={styles.btnDanger} type="button">
-              Stop
+            <button
+              type="button"
+              onClick={() =>
+                setPadPresets(
+                  Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS")
+                )
+              }
+              style={styles.modeButton}
+            >
+              Auto all
             </button>
+            <button
+              type="button"
+              onClick={() => setVoiceLead((v) => !v)}
+              aria-pressed={voiceLead}
+              style={{
+                ...styles.modeButton,
+                ...(voiceLead ? styles.modeButtonOn : {}),
+              }}
+            >
+              Voice lead
+            </button>
+          </div>
+        </section>
+
+        <section style={styles.section}>
+          <div style={styles.playSurfaceHead}>
+            <div>
+              <div style={styles.label}>Play pads</div>
+              <div style={styles.mutedSmall}>
+                1-4 / Q-R / A-F / Z-V で押している間だけ鳴ります
+              </div>
+            </div>
+            <div style={styles.playSurfaceMeta}>
+              {latchMode ? "Latch on" : "Hold"} ·{" "}
+              {sustainDown ? "Sustain on" : instrumentLabel(instrument)}
+            </div>
+          </div>
+          <div style={styles.quickGrid}>
+            {padModels.map((p) => renderPadButton(p, "quick"))}
           </div>
         </section>
 
@@ -900,7 +1909,7 @@ export default function Page() {
 
           <div style={styles.mutedSmall}>
             Holdは Tone.Transport で Attack をスケジュール（キャンセル可能）。
-            1〜9キーも、Dockも、情報Padも「押している間鳴る / 離すと止まる」。
+            4x4キー、Dock、Padは「押している間鳴る / 離すと止まる」。
           </div>
         </section>
 
@@ -1038,58 +2047,14 @@ export default function Page() {
 
         <section style={styles.section}>
           <div style={styles.label}>
-            Pads（押している間鳴る / 1〜9でもホールド） ※Padごとにボイシング指定
+            Pads（4x4キーでホールド / Space sustain / L latch） ※Padごとにボイシング指定
           </div>
 
           <div style={styles.grid}>
             {padModels.map((p) => {
-              const disabled = !p.ok;
               return (
                 <div key={p.idx} style={styles.padWrap}>
-                  <button
-                    type="button"
-                    disabled={disabled}
-                    onPointerDown={async (e) => {
-                      e.preventDefault();
-                      (e.currentTarget as HTMLElement).setPointerCapture?.(
-                        e.pointerId
-                      );
-                      await startHoldByIndex(p.idx);
-                    }}
-                    onPointerUp={(e) => {
-                      e.preventDefault();
-                      stopHoldByIndex(p.idx);
-                      (e.currentTarget as HTMLElement).releasePointerCapture?.(
-                        e.pointerId
-                      );
-                    }}
-                    onPointerCancel={(e) => {
-                      e.preventDefault();
-                      stopHoldByIndex(p.idx);
-                    }}
-                    style={{
-                      ...styles.pad,
-                      opacity: disabled ? 0.45 : 1,
-                      cursor: disabled ? "not-allowed" : "pointer",
-                      outline:
-                        guidePadIdx === p.idx
-                          ? "2px solid rgba(147,197,253,0.55)"
-                          : "none",
-                    }}
-                  >
-                    <div style={styles.padTop}>
-                      #{p.idx + 1} {p.chord || "—"}
-                    </div>
-                    <div style={styles.padRoman}>{p.roman || " "}</div>
-                    <div style={styles.padNotes}>
-                      {p.notes.length
-                        ? p.notes.join(" ")
-                        : "（解析できません）"}
-                    </div>
-                    <div style={styles.mutedSmall}>
-                      midis: {p.midis.length ? p.midis.join(", ") : "-"}
-                    </div>
-                  </button>
+                  {renderPadButton(p, "detail")}
 
                   <div style={styles.padSelectLabel}>Pad voicing preset</div>
                   <select
@@ -1177,6 +2142,10 @@ export default function Page() {
                   <span style={styles.logT}>{r.t}</span>
                   <span style={styles.logChord}>{r.chord}</span>
                   <span style={styles.logRoman}>{r.roman || ""}</span>
+                  <span style={styles.logInstrument}>
+                    {INSTRUMENT_PRESETS.find((p) => p.id === r.instrument)
+                      ?.shortLabel ?? r.instrument}
+                  </span>
                   <span style={styles.logNotes}>{r.notes.join(" ")}</span>
                 </div>
               ))
@@ -1191,8 +2160,8 @@ export default function Page() {
 const styles: Record<string, React.CSSProperties> = {
   page: {
     minHeight: "100vh",
-    background: "#020617",
-    color: "#e5e7eb",
+    background: "linear-gradient(135deg, #f8fbff 0%, #eef6ff 48%, #f7fff9 100%)",
+    color: "#172033",
     padding: 24,
     display: "flex",
     justifyContent: "center",
@@ -1200,30 +2169,141 @@ const styles: Record<string, React.CSSProperties> = {
   },
   card: {
     width: "100%",
-    maxWidth: 980,
-    border: "1px solid #1f2937",
-    borderRadius: 16,
+    maxWidth: 1180,
+    border: "1px solid rgba(148,163,184,0.24)",
+    borderRadius: 8,
     padding: 18,
-    background: "#0b1220",
-    boxShadow: "0 18px 45px rgba(0,0,0,0.55)",
+    background: "rgba(255,255,255,0.92)",
+    boxShadow: "0 24px 70px rgba(15,23,42,0.12)",
   },
-  h1: { fontSize: 18, margin: 0, marginBottom: 14, fontWeight: 800 },
+  appHeader: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 16,
+    flexWrap: "wrap",
+    paddingBottom: 14,
+    borderBottom: "1px solid rgba(148,163,184,0.22)",
+  },
+  h1: { fontSize: 26, margin: 0, fontWeight: 900, letterSpacing: 0 },
+  headerMeta: {
+    marginTop: 4,
+    color: "#64748b",
+    fontSize: 12,
+    fontWeight: 800,
+  },
+  headerControls: {
+    display: "flex",
+    alignItems: "end",
+    justifyContent: "flex-end",
+    gap: 8,
+    flexWrap: "wrap",
+  },
+  controlGroup: { width: 300, maxWidth: "100%" },
+  instrumentStrip: {
+    display: "flex",
+    gap: 6,
+    flexWrap: "wrap",
+    marginTop: 7,
+  },
+  instrumentChip: {
+    height: 24,
+    borderRadius: 999,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "#ffffff",
+    color: "#64748b",
+    padding: "0 9px",
+    cursor: "pointer",
+    fontSize: 11,
+    fontWeight: 900,
+  },
+  instrumentChipOn: {
+    border: "1px solid rgba(37,99,235,0.32)",
+    background: "#eff6ff",
+    color: "#1d4ed8",
+    boxShadow: "inset 0 -2px 0 rgba(37,99,235,0.18)",
+  },
 
   section: { marginTop: 14 },
   sectionRow: { marginTop: 14, display: "flex", gap: 12, flexWrap: "wrap" },
 
   label: { fontSize: 12, fontWeight: 800, marginBottom: 6 },
-  muted: { fontSize: 12, color: "#94a3b8" },
-  mutedSmall: { fontSize: 11, color: "#94a3b8" },
+  muted: { fontSize: 12, color: "#64748b" },
+  mutedSmall: { fontSize: 11, color: "#64748b" },
 
   row2: { display: "flex", gap: 8 },
+  actionRow: {
+    display: "flex",
+    gap: 8,
+    flexWrap: "wrap",
+    alignItems: "center",
+    marginTop: 8,
+  },
+  actionSpacer: {
+    width: 1,
+    height: 24,
+    background: "rgba(148,163,184,0.24)",
+    margin: "0 2px",
+  },
+  pillButton: {
+    height: 28,
+    padding: "0 10px",
+    borderRadius: 999,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#334155",
+    cursor: "pointer",
+    fontSize: 11,
+    fontWeight: 900,
+  },
+  nextButton: {
+    height: 28,
+    padding: "0 9px",
+    borderRadius: 999,
+    border: "1px solid rgba(20,184,166,0.32)",
+    background: "#f0fdfa",
+    color: "#115e59",
+    cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    fontSize: 11,
+    fontWeight: 900,
+  },
+  nextTag: {
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: 800,
+  },
+  sectionBuilder: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 12,
+    flexWrap: "wrap",
+    border: "1px solid rgba(37,99,235,0.18)",
+    borderRadius: 8,
+    padding: 10,
+    background: "linear-gradient(135deg, #ffffff 0%, #eff6ff 100%)",
+  },
+  sectionMeta: {
+    color: "#1d4ed8",
+    fontSize: 12,
+    fontWeight: 900,
+  },
+  sectionControls: {
+    display: "flex",
+    gap: 8,
+    alignItems: "center",
+    flexWrap: "wrap",
+  },
 
   textarea: {
     width: "100%",
-    background: "#020617",
-    color: "#e5e7eb",
-    border: "1px solid #334155",
-    borderRadius: 10,
+    background: "#ffffff",
+    color: "#172033",
+    border: "1px solid rgba(148,163,184,0.30)",
+    borderRadius: 8,
     padding: 10,
     fontFamily: "Menlo, Monaco, Consolas, monospace",
     fontSize: 13,
@@ -1231,20 +2311,20 @@ const styles: Record<string, React.CSSProperties> = {
   select: {
     width: "100%",
     height: 34,
-    background: "#020617",
-    color: "#e5e7eb",
-    border: "1px solid #334155",
-    borderRadius: 10,
+    background: "#ffffff",
+    color: "#172033",
+    border: "1px solid rgba(148,163,184,0.30)",
+    borderRadius: 8,
     padding: "0 10px",
   },
 
   btnMini: {
     height: 28,
     padding: "0 10px",
-    borderRadius: 999,
-    border: "1px solid #334155",
-    background: "#0b1220",
-    color: "#e5e7eb",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#172033",
     cursor: "pointer",
     fontWeight: 800,
     fontSize: 12,
@@ -1252,22 +2332,41 @@ const styles: Record<string, React.CSSProperties> = {
   btnDanger: {
     height: 36,
     padding: "0 12px",
-    borderRadius: 10,
-    border: "1px solid #7f1d1d",
-    background: "#111827",
-    color: "#fecaca",
+    borderRadius: 8,
+    border: "1px solid rgba(239,68,68,0.34)",
+    background: "#fff1f2",
+    color: "#be123c",
     cursor: "pointer",
     fontWeight: 900,
   },
+  modeButton: {
+    height: 36,
+    padding: "0 12px",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#334155",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 12,
+    userSelect: "none",
+    touchAction: "none",
+  },
+  modeButtonOn: {
+    border: "1px solid rgba(20,184,166,0.48)",
+    background: "#ecfeff",
+    color: "#0f766e",
+    boxShadow: "inset 0 -2px 0 rgba(20,184,166,0.28)",
+  },
 
   romanBox: {
-    border: "1px solid #1f2937",
-    borderRadius: 10,
+    border: "1px solid rgba(148,163,184,0.24)",
+    borderRadius: 8,
     padding: 10,
-    background: "#020617",
+    background: "#f8fafc",
     fontFamily: "Menlo, Monaco, Consolas, monospace",
     fontSize: 12,
-    color: "#cbd5e1",
+    color: "#334155",
   },
 
   perfTopRow: {
@@ -1280,14 +2379,14 @@ const styles: Record<string, React.CSSProperties> = {
 
   perfGrid: {
     display: "grid",
-    gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
     gap: 10,
   },
   perfItem: {
-    border: "1px solid rgba(148,163,184,0.12)",
-    borderRadius: 12,
+    border: "1px solid rgba(148,163,184,0.22)",
+    borderRadius: 8,
     padding: 10,
-    background: "rgba(2,6,23,0.35)",
+    background: "#ffffff",
   },
   perfHead: {
     display: "flex",
@@ -1296,9 +2395,9 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: 6,
     fontSize: 12,
     fontWeight: 800,
-    color: "#cbd5e1",
+    color: "#172033",
   },
-  perfVal: { fontSize: 11, color: "#94a3b8", fontWeight: 800 },
+  perfVal: { fontSize: 11, color: "#64748b", fontWeight: 800 },
 
   // guide
   guideRow: {
@@ -1308,9 +2407,9 @@ const styles: Record<string, React.CSSProperties> = {
     flexWrap: "wrap",
     marginBottom: 8,
     padding: 10,
-    borderRadius: 12,
-    border: "1px solid rgba(148,163,184,0.12)",
-    background: "rgba(2,6,23,0.35)",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.22)",
+    background: "#ffffff",
   },
   chk: { display: "flex", gap: 8, alignItems: "center", fontSize: 12 },
 
@@ -1323,10 +2422,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   suggestPanel: {
     width: 360,
-    border: "1px solid rgba(148,163,184,0.12)",
-    borderRadius: 14,
+    maxWidth: "100%",
+    border: "1px solid rgba(148,163,184,0.22)",
+    borderRadius: 8,
     padding: 10,
-    background: "rgba(2,6,23,0.35)",
+    background: "#ffffff",
   },
   suggestTitle: { fontSize: 12, fontWeight: 900, marginBottom: 8 },
   suggestMeta: {
@@ -1335,9 +2435,9 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: 10,
     fontSize: 12,
   },
-  suggestKey: { color: "#94a3b8", fontWeight: 800 },
+  suggestKey: { color: "#64748b", fontWeight: 800 },
   suggestVal: {
-    color: "#e5e7eb",
+    color: "#172033",
     fontFamily: "Menlo, Monaco, Consolas, monospace",
   },
 
@@ -1349,10 +2449,10 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chip: {
     height: 34,
-    borderRadius: 999,
-    border: "1px solid rgba(148,163,184,0.20)",
-    background: "#020617",
-    color: "#e5e7eb",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "#ffffff",
+    color: "#172033",
     cursor: "pointer",
     fontWeight: 900,
     fontSize: 12,
@@ -1363,46 +2463,213 @@ const styles: Record<string, React.CSSProperties> = {
   },
   chipTag: {
     fontSize: 10,
-    color: "#93c5fd",
+    color: "#0f766e",
     fontWeight: 800,
+  },
+
+  progressionHead: {
+    display: "flex",
+    alignItems: "end",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 10,
+    flexWrap: "wrap",
+  },
+  progressionControls: {
+    display: "flex",
+    gap: 8,
+    alignItems: "center",
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+  },
+  searchInput: {
+    width: 120,
+    height: 34,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#172033",
+    padding: "0 10px",
+    fontSize: 12,
+  },
+  progressionGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
+    gap: 8,
+  },
+  progressionItem: {
+    display: "grid",
+    gridTemplateColumns: "1fr 34px",
+    gap: 6,
+  },
+  progressionMain: {
+    minHeight: 76,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "#ffffff",
+    color: "#172033",
+    padding: "9px 10px",
+    textAlign: "left",
+    cursor: "pointer",
+    display: "grid",
+    gap: 3,
+  },
+  progressionName: {
+    fontSize: 12,
+    fontWeight: 900,
+  },
+  progressionAlias: {
+    color: "#0f766e",
+    fontSize: 11,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontWeight: 900,
+  },
+  progressionChords: {
+    color: "#64748b",
+    fontSize: 11,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  progressionTags: {
+    color: "#94a3b8",
+    fontSize: 10,
+    fontWeight: 800,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  progressionAppend: {
+    borderRadius: 8,
+    border: "1px solid rgba(20,184,166,0.34)",
+    background: "#ecfeff",
+    color: "#0f766e",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 18,
+  },
+  emptyHint: {
+    marginTop: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    borderRadius: 8,
+    padding: 10,
+    background: "#f8fafc",
+    color: "#64748b",
+    fontSize: 12,
+    fontWeight: 800,
+  },
+
+  playSurfaceHead: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "end",
+    gap: 12,
+    marginBottom: 10,
+  },
+  playSurfaceMeta: {
+    color: "#0f766e",
+    fontSize: 12,
+    fontWeight: 900,
+  },
+  quickGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(118px, 1fr))",
+    gap: 10,
+  },
+  quickPad: {
+    minHeight: 82,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "linear-gradient(160deg, #ffffff 0%, #eef7ff 100%)",
+    color: "#172033",
+    padding: 10,
+    textAlign: "left",
+    userSelect: "none",
+    touchAction: "none",
+    boxShadow: "0 10px 24px rgba(15,23,42,0.08)",
+  },
+  quickPadActive: {
+    border: "1px solid rgba(20,184,166,0.68)",
+    background: "linear-gradient(160deg, #ecfeff 0%, #ffffff 74%)",
+    boxShadow: "0 0 0 3px rgba(20,184,166,0.16), 0 16px 34px rgba(15,118,110,0.16), inset 0 -3px 0 rgba(20,184,166,0.24)",
+  },
+  quickPadTop: {
+    color: "#64748b",
+    fontSize: 11,
+    fontWeight: 900,
+    marginBottom: 8,
+  },
+  quickPadChord: {
+    color: "#172033",
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 18,
+    fontWeight: 900,
+    lineHeight: 1.1,
+  },
+  quickPadRoman: {
+    marginTop: 6,
+    color: "#0f766e",
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 12,
+    fontWeight: 900,
   },
 
   // pads
   grid: {
     display: "grid",
-    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
     gap: 12,
   },
   padWrap: {
-    border: "1px solid rgba(148,163,184,0.12)",
-    borderRadius: 14,
+    border: "1px solid rgba(148,163,184,0.22)",
+    borderRadius: 8,
     padding: 10,
-    background: "rgba(2,6,23,0.35)",
+    background: "#ffffff",
   },
   pad: {
     width: "100%",
     textAlign: "left",
-    borderRadius: 14,
-    border: "1px solid #263045",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
     padding: 12,
-    background: "radial-gradient(circle at 30% 30%, #1f2937, #020617 70%)",
-    color: "#e5e7eb",
+    background: "linear-gradient(160deg, #ffffff 0%, #eef7ff 100%)",
+    color: "#172033",
     userSelect: "none",
     touchAction: "none",
+    boxShadow: "0 10px 24px rgba(15,23,42,0.08), inset 0 1px 0 rgba(255,255,255,0.9)",
   },
-  padTop: { fontSize: 12, fontWeight: 900, marginBottom: 6 },
+  padActive: {
+    border: "1px solid rgba(20,184,166,0.68)",
+    background: "linear-gradient(160deg, #ecfeff 0%, #ffffff 74%)",
+    boxShadow: "0 0 0 3px rgba(20,184,166,0.16), 0 16px 34px rgba(15,118,110,0.16), inset 0 -3px 0 rgba(20,184,166,0.24)",
+  },
+  padTop: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 8,
+    fontSize: 12,
+    fontWeight: 900,
+    marginBottom: 6,
+  },
   padRoman: {
     fontSize: 11,
-    color: "#93c5fd",
+    color: "#0f766e",
     marginBottom: 6,
     fontWeight: 700,
+  },
+  padToneSummary: {
+    marginBottom: 5,
+    color: "#64748b",
+    fontSize: 11,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
   },
   padNotes: { fontSize: 13, fontFamily: "Menlo, Monaco, Consolas, monospace" },
   padSelectLabel: {
     marginTop: 10,
     marginBottom: 6,
     fontSize: 11,
-    color: "#94a3b8",
+    color: "#64748b",
     fontWeight: 800,
   },
   omitRow: {
@@ -1417,16 +2684,16 @@ const styles: Record<string, React.CSSProperties> = {
     gap: 6,
     alignItems: "center",
     fontSize: 12,
-    color: "#cbd5e1",
+    color: "#334155",
   },
 
   // log
   logBox: {
     marginTop: 8,
-    border: "1px solid #1f2937",
-    borderRadius: 10,
+    border: "1px solid rgba(148,163,184,0.22)",
+    borderRadius: 8,
     padding: 10,
-    background: "#020617",
+    background: "#f8fafc",
     maxHeight: 220,
     overflow: "auto",
     fontFamily: "Menlo, Monaco, Consolas, monospace",
@@ -1434,15 +2701,16 @@ const styles: Record<string, React.CSSProperties> = {
   },
   logRow: {
     display: "grid",
-    gridTemplateColumns: "80px 90px 90px 1fr",
+    gridTemplateColumns: "80px 90px 90px 90px 1fr",
     gap: 10,
     padding: "3px 0",
-    borderBottom: "1px solid rgba(148,163,184,0.12)",
+    borderBottom: "1px solid rgba(148,163,184,0.16)",
   },
-  logT: { color: "#94a3b8" },
-  logChord: { color: "#e5e7eb" },
-  logRoman: { color: "#93c5fd" },
-  logNotes: { color: "#e5e7eb" },
+  logT: { color: "#64748b" },
+  logChord: { color: "#172033" },
+  logRoman: { color: "#0f766e" },
+  logInstrument: { color: "#b45309" },
+  logNotes: { color: "#172033" },
 
   // dock
   dockWrap: {
@@ -1459,10 +2727,10 @@ const styles: Record<string, React.CSSProperties> = {
   dockToggle: {
     height: 36,
     padding: "0 12px",
-    borderRadius: 999,
-    border: "1px solid rgba(148,163,184,0.25)",
-    background: "rgba(2,6,23,0.85)",
-    color: "#e5e7eb",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.28)",
+    background: "rgba(255,255,255,0.92)",
+    color: "#172033",
     cursor: "pointer",
     fontWeight: 900,
     fontSize: 12,
@@ -1470,10 +2738,11 @@ const styles: Record<string, React.CSSProperties> = {
   },
   dockPanel: {
     width: 320,
-    borderRadius: 16,
-    border: "1px solid rgba(148,163,184,0.18)",
-    background: "rgba(2,6,23,0.82)",
-    boxShadow: "0 18px 45px rgba(0,0,0,0.55)",
+    maxWidth: "calc(100vw - 32px)",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "rgba(255,255,255,0.92)",
+    boxShadow: "0 18px 45px rgba(15,23,42,0.14)",
     padding: 10,
     backdropFilter: "blur(8px)",
   },
@@ -1485,16 +2754,21 @@ const styles: Record<string, React.CSSProperties> = {
   },
   dockPad: {
     height: 68,
-    borderRadius: 14,
-    background: "radial-gradient(circle at 30% 30%, #1f2937, #020617 75%)",
-    color: "#e5e7eb",
-    border: "1px solid rgba(148,163,184,0.18)",
+    borderRadius: 8,
+    background: "linear-gradient(160deg, #ffffff 0%, #f1f7ff 100%)",
+    color: "#172033",
+    border: "1px solid rgba(148,163,184,0.24)",
     userSelect: "none",
     touchAction: "none",
     padding: 8,
     textAlign: "left",
   },
-  dockPadTop: { fontSize: 11, fontWeight: 900, color: "#cbd5e1" },
+  dockPadActive: {
+    border: "1px solid rgba(20,184,166,0.68)",
+    background: "linear-gradient(160deg, #ecfeff 0%, #ffffff 80%)",
+    boxShadow: "0 0 0 2px rgba(20,184,166,0.14), inset 0 -3px 0 rgba(20,184,166,0.24)",
+  },
+  dockPadTop: { fontSize: 11, fontWeight: 900, color: "#334155" },
   dockPadChord: {
     fontSize: 12,
     fontWeight: 900,
@@ -1504,14 +2778,14 @@ const styles: Record<string, React.CSSProperties> = {
   dockPadRoman: {
     fontSize: 11,
     marginTop: 2,
-    color: "#93c5fd",
+    color: "#0f766e",
     fontWeight: 800,
     fontFamily: "Menlo, Monaco, Consolas, monospace",
   },
   dockHint: {
     marginTop: 8,
     fontSize: 11,
-    color: "#94a3b8",
+    color: "#64748b",
     fontWeight: 700,
   },
 };

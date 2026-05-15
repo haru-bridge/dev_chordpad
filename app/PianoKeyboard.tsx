@@ -1,8 +1,8 @@
 // app/PianoKeyboard.tsx
 "use client";
 
-import React, { useMemo, useRef, useEffect, useState } from "react";
-import * as Tone from "tone";
+import React, { memo, useMemo, useRef, useEffect, useState } from "react";
+import { midiToNoteName } from "../lib/musicNote";
 
 type Props = {
   minMidi: number; // inclusive
@@ -56,7 +56,7 @@ type KeyModel = {
   mod12: number;
 };
 
-export function PianoKeyboard({
+export const PianoKeyboard = memo(function PianoKeyboard({
   minMidi,
   maxMidi,
   height = 92,
@@ -73,9 +73,11 @@ export function PianoKeyboard({
   );
   const guideExtSet = useMemo(() => new Set(guideExtMidis), [guideExtMidis]);
 
-  const keys = useMemo(() => {
-    const res: KeyModel[] = [];
+  const { whiteKeys, blackKeys, totalWhite } = useMemo(() => {
+    const whites: KeyModel[] = [];
+    const blacks: KeyModel[] = [];
     let whiteCount = 0;
+
     for (let m = minMidi; m <= maxMidi; m++) {
       const w = isWhite(m);
       const model: KeyModel = {
@@ -84,16 +86,13 @@ export function PianoKeyboard({
         isWhite: w,
         mod12: ((m % 12) + 12) % 12,
       };
-      res.push(model);
+      if (w) whites.push(model);
+      else if (isBlack(m)) blacks.push(model);
       if (w) whiteCount++;
     }
-    return res;
-  }, [minMidi, maxMidi]);
 
-  const totalWhite = useMemo(
-    () => keys.filter((k) => k.isWhite).length,
-    [keys]
-  );
+    return { whiteKeys: whites, blackKeys: blacks, totalWhite: whiteCount };
+  }, [minMidi, maxMidi]);
 
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const [wrapW, setWrapW] = useState(780);
@@ -119,8 +118,8 @@ export function PianoKeyboard({
 
   const guideShadowFor = (midi: number) => {
     // “薄いガイド”＝キー色は変えず、下にラインだけ
-    if (guideChordSet.has(midi)) return "inset 0 -6px 0 rgba(59,130,246,0.38)";
-    if (guideExtSet.has(midi)) return "inset 0 -6px 0 rgba(148,163,184,0.25)";
+    if (guideChordSet.has(midi)) return "inset 0 -6px 0 rgba(20,184,166,0.42)";
+    if (guideExtSet.has(midi)) return "inset 0 -6px 0 rgba(251,191,36,0.30)";
     return undefined;
   };
 
@@ -131,84 +130,80 @@ export function PianoKeyboard({
         position: "relative",
         width: "100%",
         height: whiteH,
-        borderRadius: 10,
-        border: "1px solid rgba(148,163,184,0.18)",
-        background: "rgba(2,6,23,0.25)",
+        borderRadius: 8,
+        border: "1px solid rgba(212,212,216,0.14)",
+        background: "#ffffff",
         overflow: "hidden",
         userSelect: "none",
         touchAction: "none",
       }}
     >
       {/* white keys */}
-      {keys
-        .filter((k) => k.isWhite)
-        .map((k) => {
-          const x = k.whiteIndex * whiteW;
-          const active = activeSet.has(k.midi);
-          const picked = pickedMidi === k.midi;
+      {whiteKeys.map((k) => {
+        const x = k.whiteIndex * whiteW;
+        const active = activeSet.has(k.midi);
+        const picked = pickedMidi === k.midi;
 
-          return (
-            <div
-              key={`w-${k.midi}`}
-              onPointerDown={(e) => {
-                e.preventDefault();
-                onDown(k.midi);
-              }}
-              style={{
-                position: "absolute",
-                left: x,
-                top: 0,
-                width: whiteW,
-                height: whiteH,
-                background: active ? "#dbeafe" : "#f8fafc",
-                borderRight: "1px solid rgba(2,6,23,0.18)",
-                boxSizing: "border-box",
-                cursor: "pointer",
-                boxShadow:
-                  (picked ? "inset 0 0 0 2px rgba(147,197,253,0.9)" : "") ||
-                  guideShadowFor(k.midi) ||
-                  undefined,
-              }}
-              title={Tone.Frequency(k.midi, "midi").toNote()}
-            />
-          );
-        })}
+        return (
+          <div
+            key={`w-${k.midi}`}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              onDown(k.midi);
+            }}
+            style={{
+              position: "absolute",
+              left: x,
+              top: 0,
+              width: whiteW,
+              height: whiteH,
+              background: active ? "#ccfbf1" : "#ffffff",
+              borderRight: "1px solid rgba(148,163,184,0.28)",
+              boxSizing: "border-box",
+              cursor: "pointer",
+              boxShadow:
+                (picked ? "inset 0 0 0 2px rgba(251,191,36,0.95)" : "") ||
+                guideShadowFor(k.midi) ||
+                undefined,
+            }}
+            title={midiToNoteName(k.midi)}
+          />
+        );
+      })}
 
       {/* black keys */}
-      {keys
-        .filter((k) => isBlack(k.midi))
-        .map((k) => {
-          const ratio = blackKeyCenterRatio(k.mod12);
-          const x = k.whiteIndex * whiteW + whiteW * ratio - blackW / 2;
+      {blackKeys.map((k) => {
+        const ratio = blackKeyCenterRatio(k.mod12);
+        const x = k.whiteIndex * whiteW + whiteW * ratio - blackW / 2;
 
-          const active = activeSet.has(k.midi);
-          const picked = pickedMidi === k.midi;
+        const active = activeSet.has(k.midi);
+        const picked = pickedMidi === k.midi;
 
-          return (
-            <div
-              key={`b-${k.midi}`}
-              onPointerDown={(e) => {
-                e.preventDefault();
-                onDown(k.midi);
-              }}
-              style={{
-                position: "absolute",
-                left: x,
-                top: 0,
-                width: blackW,
-                height: blackH,
-                background: active ? "#60a5fa" : "#0f172a",
-                borderRadius: 6,
-                boxShadow:
-                  (picked ? "inset 0 0 0 2px rgba(147,197,253,0.9)" : "") ||
-                  guideShadowFor(k.midi) ||
-                  "0 6px 18px rgba(0,0,0,0.45)",
-                cursor: "pointer",
-              }}
-              title={Tone.Frequency(k.midi, "midi").toNote()}
-            />
-          );
-        })}
+        return (
+          <div
+            key={`b-${k.midi}`}
+            onPointerDown={(e) => {
+              e.preventDefault();
+              onDown(k.midi);
+            }}
+            style={{
+              position: "absolute",
+              left: x,
+              top: 0,
+              width: blackW,
+              height: blackH,
+              background: active ? "#14b8a6" : "#1f2937",
+              borderRadius: 5,
+              boxShadow:
+                (picked ? "inset 0 0 0 2px rgba(251,191,36,0.95)" : "") ||
+                guideShadowFor(k.midi) ||
+                "0 6px 18px rgba(0,0,0,0.45)",
+              cursor: "pointer",
+            }}
+            title={midiToNoteName(k.midi)}
+          />
+        );
+      })}
     </div>
   );
-}
+});
