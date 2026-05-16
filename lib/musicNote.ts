@@ -24,7 +24,7 @@ const SHARP_NAMES = [
 ] as const;
 
 export function normalizePc(pc: string): string {
-  const s = pc.trim().replace("♭", "b").replace("♯", "#");
+  const s = pc.trim().replace(/♭/g, "b").replace(/♯/g, "#");
   const head = s.charAt(0).toUpperCase();
   const tail = s.slice(1);
   return head + tail;

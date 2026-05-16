@@ -77,6 +77,22 @@ function orderForArp(items: Item[], pat: ArpPattern) {
   return ordered; // up
 }
 
+function voiceBalanceFactor(item: Item, midis: number[], playMode: PlayMode) {
+  if (playMode === "arp" || midis.length <= 1) return 1;
+
+  const sorted = [...midis].sort((a, b) => a - b);
+  const rank = sorted.findIndex((midi) => midi === item.midi);
+  if (rank < 0) return 1;
+
+  const topRank = sorted.length - 1;
+  if (rank === topRank) return 1.03;
+  if (rank === 0) return sorted.length >= 4 ? 0.82 : 0.88;
+
+  // Common keyboard comping balance: bass supports, inner voices tuck back,
+  // top voice speaks clearly.
+  return 0.76 + (rank / topRank) * 0.12;
+}
+
 type NormalizedPerf = {
   strumMs: number;
   direction: StrumDirection;
@@ -195,7 +211,7 @@ export function buildNoteEvents(
     d = Math.max(0, d);
 
     // velocity
-    let v = p.baseVelocity;
+    let v = p.baseVelocity * voiceBalanceFactor(it, midis, p.playMode);
     if (p.velocityHumanize > 0) {
       v *= 1 + randBetween(-p.velocityHumanize, p.velocityHumanize);
     }
@@ -213,7 +229,6 @@ export function buildNoteEvents(
     };
   });
 }
-
 
 
 

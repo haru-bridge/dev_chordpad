@@ -141,7 +141,7 @@ function guessQuality(symbol: string, tonalQuality?: string): Parsed["qualityGue
 function parseChordSymbol(input: string): Parsed | null {
   const cacheKey = input.trim().replace(/♭/g, "b").replace(/♯/g, "#");
   return cacheParsedChord(cacheKey, () => {
-    const { core, slash } = splitSlash(input);
+    const { core, slash } = splitSlash(cacheKey);
     const c = Chord.get(core);
     if (!c?.tonic) return null;
 
