@@ -1,7 +1,13 @@
 // app/dev/page.tsx  (※パスはあなたの実ファイル構成に合わせて調整)
 "use client";
 
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, {
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import type { PolySynth, ToneAudioNode } from "tone";
 import {
   buildPadVoicing,
@@ -23,21 +29,20 @@ import {
 } from "../lib/instruments";
 import { midiFromPc, midiToNoteName } from "../lib/musicNote";
 import {
-  matchesProgressionMood,
-  PROGRESSION_CATEGORIES,
-  PROGRESSION_MOODS,
-  PROGRESSION_PRESETS,
   SECTION_SHAPES,
   generateSectionChords,
-  progressionMoods,
-  progressionToChords,
-  romanTokenToChord,
-  suggestNextRomans,
-  type ProgressionCategory,
-  type ProgressionMood,
-  type ProgressionPreset,
   type SectionShapeId,
 } from "../lib/progressions";
+import {
+  filterProgressionPresets,
+  PRESET_COMPLEXITIES,
+  PRESET_GENRES,
+  PRESET_MOODS,
+  progressionPresetRomanLabel,
+  progressionPresetToChords,
+  STARTER_PRESETS,
+  type StarterProgressionPreset,
+} from "../lib/progressionPresets";
 import {
   CHORD_TRANSFORMS,
   transformChordSymbols,
@@ -53,6 +58,14 @@ import {
 
 import { suggestChordsFromPc, toFlatPc } from "../lib/chordSuggest";
 import { getChordGuidePcs } from "../lib/chordGuide";
+import {
+  recommendBetweenChords,
+  recommendColorOptions,
+  recommendExtensions,
+  recommendNextChord,
+  recommendSubstitutions,
+  type ChordSuggestion,
+} from "../lib/chordRecommendations";
 
 type LogRow = {
   t: string;
@@ -67,6 +80,7 @@ type LogRow = {
 };
 
 const MAX_PADS = 16;
+const PRESET_RENDER_LIMIT = 24;
 const PAD_KEY_LAYOUT = [
   "1",
   "2",
@@ -105,10 +119,44 @@ const KEY_ROOTS = [
 
 type KeyRoot = (typeof KEY_ROOTS)[number];
 type KeyMode = "major" | "minor";
-type ProgressionCategoryFilter = ProgressionCategory | "All";
+type SmartSuggestionMode = "between" | "next" | "substitute" | "extend" | "color";
+type SmartSuggestionTarget = "chord" | "gap";
 
 function nowStr() {
   return new Date().toLocaleTimeString();
+}
+
+function chordListFromText(value: string) {
+  return value
+    .split(/[\s,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, MAX_PADS);
+}
+
+const SMART_MODES = ["between", "next", "substitute", "extend", "color"] as const;
+
+const SMART_MODE_LABELS: Record<SmartSuggestionMode, string> = {
+  between: "Between",
+  next: "Next",
+  substitute: "Substitute",
+  extend: "Extend",
+  color: "Color",
+};
+
+const SMART_MODE_HELP: Record<SmartSuggestionMode, string> = {
+  between: "左右のコードを見て、間に入れる候補を出します。",
+  next: "選んだコードの次に置ける候補を出します。",
+  substitute: "選んだコードを機能が近い別案に置き換えます。",
+  extend: "今の進行の後ろに短い続きやターンアラウンドを足します。",
+  color: "借用和音やセカンダリードミナントなどの色を足します。",
+};
+
+function suggestionActionLabel(suggestion: ChordSuggestion) {
+  if (suggestion.action === "replace") return "Replace";
+  if (suggestion.action === "insert") return "Insert";
+  if (suggestion.action === "extend") return "Add";
+  return "+";
 }
 
 type HoldState = {
@@ -144,13 +192,20 @@ export default function Page() {
   const [instrument, setInstrument] = useState<InstrumentId>("soft_keys");
   const [latchMode, setLatchMode] = useState(false);
   const [sustainDown, setSustainDown] = useState(false);
-  const [progressionCategory, setProgressionCategory] =
-    useState<ProgressionCategoryFilter>("All");
-  const [progressionMood, setProgressionMood] =
-    useState<ProgressionMood>("All");
+  const [progressionGenre, setProgressionGenre] = useState("All");
+  const [progressionMood, setProgressionMood] = useState("All");
+  const [progressionComplexity, setProgressionComplexity] = useState("All");
   const [progressionSearch, setProgressionSearch] = useState("");
+  const [presetPanelOpen, setPresetPanelOpen] = useState(true);
   const [sectionBars, setSectionBars] = useState(8);
   const [sectionShape, setSectionShape] = useState<SectionShapeId>("story");
+  const [smartMode, setSmartMode] = useState<SmartSuggestionMode>("next");
+  const [suggestionTarget, setSuggestionTarget] =
+    useState<SmartSuggestionTarget>("chord");
+  const [suggestionAnchorIndex, setSuggestionAnchorIndex] = useState<
+    number | null
+  >(null);
+  const [suggestionGapIndex, setSuggestionGapIndex] = useState(0);
   const [shareStatus, setShareStatus] = useState("");
 
   // --- per pad preset ---
@@ -249,7 +304,7 @@ export default function Page() {
   // -------------------------
   // Dock UI state
   // -------------------------
-  const [dockOpen, setDockOpen] = useState(true);
+  const [dockOpen, setDockOpen] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
 
   const analysisKey: KeySig = useMemo(
@@ -267,13 +322,18 @@ export default function Page() {
     [analysisKey.tonic, playKey.tonic]
   );
 
+  const deferredText = useDeferredValue(text);
+
   const chordSymbols = useMemo(() => {
-    const items = text
-      .split(/[\s,]+/)
-      .map((s) => s.trim())
-      .filter(Boolean);
-    return items.slice(0, MAX_PADS);
-  }, [text]);
+    return chordListFromText(deferredText);
+  }, [deferredText]);
+
+  const chordTextPending = deferredText !== text;
+
+  const romanContext = useMemo(
+    () => chordSymbols.map((chord) => romanizeChord(chord, analysisKey)),
+    [chordSymbols, analysisKey]
+  );
 
   const padModels = useMemo(() => {
     let prevMidis: number[] = [];
@@ -303,7 +363,7 @@ export default function Page() {
         voiceLead && v ? smoothVoiceLead(prevMidis, v.midis) : v?.midis ?? [];
       const ledMidis = normalizePadRange(rawMidis, centerOctave);
       if (ledMidis.length) prevMidis = ledMidis;
-      const roman = romanizeChord(chord, analysisKey);
+      const roman = romanContext[i] ?? "";
 
       return {
         idx: i,
@@ -323,7 +383,7 @@ export default function Page() {
     padOmits,
     centerOctave,
     shift,
-    analysisKey,
+    romanContext,
     voiceLead,
   ]);
 
@@ -417,13 +477,24 @@ export default function Page() {
         setLatchMode(saved.latchMode);
       }
       if (
-        saved.progressionCategory === "All" ||
-        PROGRESSION_CATEGORIES.includes(saved.progressionCategory as ProgressionCategory)
+        saved.progressionGenre === "All" ||
+        PRESET_GENRES.includes(saved.progressionGenre as string)
       ) {
-        setProgressionCategory(saved.progressionCategory as ProgressionCategoryFilter);
+        setProgressionGenre(saved.progressionGenre as string);
       }
-      if (PROGRESSION_MOODS.includes(saved.progressionMood as ProgressionMood)) {
-        setProgressionMood(saved.progressionMood as ProgressionMood);
+      if (
+        saved.progressionMood === "All" ||
+        PRESET_MOODS.includes(saved.progressionMood as string)
+      ) {
+        setProgressionMood(saved.progressionMood as string);
+      }
+      if (
+        saved.progressionComplexity === "All" ||
+        PRESET_COMPLEXITIES.includes(
+          saved.progressionComplexity as (typeof PRESET_COMPLEXITIES)[number]
+        )
+      ) {
+        setProgressionComplexity(saved.progressionComplexity as string);
       }
       if (typeof saved.progressionSearch === "string") {
         setProgressionSearch(saved.progressionSearch);
@@ -488,8 +559,9 @@ export default function Page() {
           voiceLead,
           instrument,
           latchMode,
-          progressionCategory,
+          progressionGenre,
           progressionMood,
+          progressionComplexity,
           progressionSearch,
           sectionBars,
           sectionShape,
@@ -512,8 +584,9 @@ export default function Page() {
     voiceLead,
     instrument,
     latchMode,
-    progressionCategory,
+    progressionGenre,
     progressionMood,
+    progressionComplexity,
     progressionSearch,
     sectionBars,
     sectionShape,
@@ -522,100 +595,245 @@ export default function Page() {
     perf,
   ]);
 
-  const romanProgression = useMemo(() => {
-    const romans = chordSymbols
-      .map((c) => romanizeChord(c, analysisKey))
-      .filter(Boolean);
-    return romans.join("  ");
-  }, [chordSymbols, analysisKey]);
-
-  const visibleProgressions = useMemo(
-    () => {
-      const query = progressionSearch.trim().toLowerCase();
-
-      return PROGRESSION_PRESETS.filter((preset) => {
-        if (
-          progressionCategory !== "All" &&
-          preset.category !== progressionCategory
-        ) {
-          return false;
-        }
-        if (!matchesProgressionMood(preset, progressionMood)) return false;
-        if (!query) return true;
-
-        const haystack = [
-          preset.category,
-          preset.name,
-          preset.alias,
-          preset.feel,
-          ...progressionMoods(preset),
-        ]
-          .join(" ")
-          .toLowerCase();
-        return haystack.includes(query);
-      });
-    },
-    [progressionCategory, progressionMood, progressionSearch]
+  const romanProgression = useMemo(
+    () => romanContext.filter(Boolean).join("  "),
+    [romanContext]
   );
 
-  const applyProgression = (preset: ProgressionPreset) => {
-    const next = progressionToChords(preset, analysisKey).slice(0, MAX_PADS);
+  const visibleProgressions = useMemo(() => {
+    return filterProgressionPresets(STARTER_PRESETS, {
+      genre: progressionGenre,
+      mood: progressionMood,
+      complexity: progressionComplexity,
+      search: progressionSearch,
+    });
+  }, [progressionComplexity, progressionGenre, progressionMood, progressionSearch]);
+
+  const visiblePresetCards = useMemo(() => {
+    if (!presetPanelOpen) return [];
+    return visibleProgressions.slice(0, PRESET_RENDER_LIMIT).map((preset) => ({
+      preset,
+      romanLabel: progressionPresetRomanLabel(preset),
+      chords: progressionPresetToChords(preset, {
+        key: analysisRoot,
+        mode: analysisMode,
+      }),
+    }));
+  }, [analysisMode, analysisRoot, presetPanelOpen, visibleProgressions]);
+
+  const applyProgression = (preset: StarterProgressionPreset) => {
+    const next = progressionPresetToChords(preset, {
+      key: analysisRoot,
+      mode: analysisMode,
+    }).slice(0, MAX_PADS);
     setText(next.join(" "));
     setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
+    setSmartMode("next");
+    setSuggestionTarget("chord");
+    setSuggestionAnchorIndex(null);
+    setSuggestionGapIndex(0);
   };
 
-  const appendProgression = (preset: ProgressionPreset) => {
-    const next = progressionToChords(preset, analysisKey);
+  const appendProgression = (preset: StarterProgressionPreset) => {
+    const next = progressionPresetToChords(preset, {
+      key: analysisRoot,
+      mode: analysisMode,
+    });
     setText((prev) => {
-      const merged = [...prev.split(/[\s,]+/).filter(Boolean), ...next].slice(
-        0,
-        MAX_PADS
-      );
+      const merged = [...chordListFromText(prev), ...next].slice(0, MAX_PADS);
       return merged.join(" ");
     });
+    setSmartMode("next");
+    setSuggestionTarget("chord");
+    setSuggestionAnchorIndex(null);
   };
 
   const applyRandomProgression = () => {
     const source = visibleProgressions.length
       ? visibleProgressions
-      : PROGRESSION_PRESETS;
+      : STARTER_PRESETS;
     const preset = source[Math.floor(Math.random() * source.length)];
     if (preset) applyProgression(preset);
   };
 
   const transformCurrentChords = (transform: ChordTransformId) => {
-    if (!chordSymbols.length) return;
-    setText(transformChordSymbols(chordSymbols, transform).join(" "));
+    const currentChords = chordListFromText(text);
+    if (!currentChords.length) return;
+    setText(transformChordSymbols(currentChords, transform).join(" "));
     setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
   };
 
-  const romanContext = useMemo(
-    () => chordSymbols.map((chord) => romanizeChord(chord, analysisKey)),
-    [chordSymbols, analysisKey]
-  );
-
   const lastRoman = romanContext[romanContext.length - 1] ?? "";
 
-  const nextChordSuggestions = useMemo(() => {
-    return suggestNextRomans(
-      lastRoman,
-      romanContext,
-      analysisKey.mode
-    ).map((suggestion) => ({
-      ...suggestion,
-      chord: romanTokenToChord(suggestion.token, analysisKey),
-    }));
-  }, [lastRoman, romanContext, analysisKey]);
+  const activeSuggestionIndex = chordSymbols.length
+    ? Math.min(
+        suggestionAnchorIndex ?? chordSymbols.length - 1,
+        chordSymbols.length - 1
+      )
+    : undefined;
 
-  const appendNextChord = (chord: string) => {
+  const activeGapIndex =
+    chordSymbols.length > 1
+      ? Math.min(suggestionGapIndex, chordSymbols.length - 2)
+      : undefined;
+
+  const smartSuggestions = useMemo(() => {
+    const common = {
+      key: analysisRoot,
+      mode: analysisMode,
+      outputKey: playRoot,
+      outputMode: analysisMode,
+      maxSuggestions: 5,
+    } as const;
+
+    if (smartMode === "between") {
+      if (activeGapIndex == null) return [];
+      return recommendBetweenChords({
+        leftChord: chordSymbols[activeGapIndex],
+        rightChord: chordSymbols[activeGapIndex + 1],
+        ...common,
+      });
+    }
+
+    if (smartMode === "substitute") {
+      if (activeSuggestionIndex == null) return [];
+      return recommendSubstitutions({
+        chord: chordSymbols[activeSuggestionIndex],
+        previousChord: chordSymbols[activeSuggestionIndex - 1],
+        nextChord: chordSymbols[activeSuggestionIndex + 1],
+        ...common,
+      });
+    }
+
+    if (smartMode === "extend") {
+      return recommendExtensions({
+        chords: chordSymbols,
+        ...common,
+        maxSuggestions: 4,
+      });
+    }
+
+    if (smartMode === "color") {
+      return recommendColorOptions({
+        chords: chordSymbols,
+        selectedIndex:
+          suggestionTarget === "chord" ? activeSuggestionIndex : undefined,
+        selectedGap:
+          suggestionTarget !== "gap" || activeGapIndex == null
+            ? undefined
+            : { leftIndex: activeGapIndex, rightIndex: activeGapIndex + 1 },
+        ...common,
+      });
+    }
+
+    return recommendNextChord({
+      chords: chordSymbols,
+      selectedIndex: activeSuggestionIndex,
+      ...common,
+    });
+  }, [
+    activeGapIndex,
+    activeSuggestionIndex,
+    analysisMode,
+    analysisRoot,
+    chordSymbols,
+    playRoot,
+    smartMode,
+    suggestionTarget,
+  ]);
+
+  const insertSuggestionIntoText = (
+    suggestion: ChordSuggestion,
+    mode: SmartSuggestionMode
+  ) => {
+    const insertSymbols = chordListFromText(
+      suggestion.sourceSymbol || suggestion.symbol
+    );
     setText((prev) => {
-      const merged = [...prev.split(/[\s,]+/).filter(Boolean), chord].slice(
-        0,
-        MAX_PADS
-      );
-      return merged.join(" ");
+      const items = chordListFromText(prev);
+      if (!items.length) return insertSymbols.join(" ");
+
+      if (suggestion.action === "replace") {
+        const replaceAt = Math.min(activeSuggestionIndex ?? 0, items.length - 1);
+        return [
+          ...items.slice(0, replaceAt),
+          ...insertSymbols,
+          ...items.slice(replaceAt + 1),
+        ]
+          .slice(0, MAX_PADS)
+          .join(" ");
+      }
+
+      const insertAt =
+        suggestion.action === "insert" ||
+        (suggestion.action === "color" && mode === "between")
+          ? Math.min((activeGapIndex ?? 0) + 1, items.length)
+          : suggestion.action === "extend"
+            ? items.length
+            : Math.min((activeSuggestionIndex ?? items.length - 1) + 1, items.length);
+
+      return [
+        ...items.slice(0, insertAt),
+        ...insertSymbols,
+        ...items.slice(insertAt),
+      ]
+        .slice(0, MAX_PADS)
+        .join(" ");
     });
   };
+
+  const selectChordForSuggestions = (index: number) => {
+    setSuggestionAnchorIndex(index);
+    setSuggestionTarget("chord");
+    if (smartMode === "between") setSmartMode("next");
+  };
+
+  const selectGapForSuggestions = (index: number) => {
+    setSuggestionGapIndex(index);
+    setSuggestionTarget("gap");
+    setSmartMode("between");
+  };
+
+  const smartContextText = useMemo(() => {
+    if (smartMode === "between") {
+      if (activeGapIndex == null) return "Between needs at least two chords.";
+      return `${chordSymbols[activeGapIndex]} → ? → ${
+        chordSymbols[activeGapIndex + 1]
+      }`;
+    }
+
+    if (smartMode === "substitute") {
+      return activeSuggestionIndex == null
+        ? "Replace: no chord selected"
+        : `Replace: ${chordSymbols[activeSuggestionIndex]}`;
+    }
+
+    if (smartMode === "extend") {
+      const tail = chordSymbols.slice(-2).join(" ");
+      return tail ? `Continue from: ... ${tail}` : "Continue from: tonic";
+    }
+
+    if (smartMode === "color") {
+      if (suggestionTarget === "gap" && activeGapIndex != null) {
+        return `Add color to: ${chordSymbols[activeGapIndex]} → ? → ${
+          chordSymbols[activeGapIndex + 1]
+        }`;
+      }
+      return activeSuggestionIndex == null
+        ? "Add color to: tonic"
+        : `Add color to: ${chordSymbols[activeSuggestionIndex]}`;
+    }
+
+    return activeSuggestionIndex == null
+      ? "Next after: tonic"
+      : `Next after: ${chordSymbols[activeSuggestionIndex]}`;
+  }, [
+    activeGapIndex,
+    activeSuggestionIndex,
+    chordSymbols,
+    smartMode,
+    suggestionTarget,
+  ]);
 
   const makeSectionChords = (mode: "replace" | "append") =>
     generateSectionChords(
@@ -1420,8 +1638,144 @@ export default function Page() {
         </header>
 
         <section style={styles.section}>
-          <div style={styles.label}>
-            Chord list（スペース/カンマ区切り → Pad割当）
+          <div style={styles.presetHead}>
+            <div>
+              <div style={styles.stepLabel}>1. Progression Starter</div>
+              <div style={styles.label}>Start from a known progression</div>
+              <div style={styles.mutedSmall}>
+                日本を中心とした定番進行を seed にして、下の候補で変形します。
+              </div>
+            </div>
+            <div style={styles.presetControls}>
+              <button
+                type="button"
+                onClick={applyRandomProgression}
+                style={styles.modeButton}
+              >
+                Random
+              </button>
+              <button
+                type="button"
+                onClick={() => setPresetPanelOpen((v) => !v)}
+                aria-expanded={presetPanelOpen}
+                style={{
+                  ...styles.modeButton,
+                  ...(presetPanelOpen ? styles.modeButtonOn : {}),
+                }}
+              >
+                {presetPanelOpen ? "Hide presets" : "Show presets"}
+              </button>
+            </div>
+          </div>
+
+          {presetPanelOpen ? (
+            <>
+              <div style={styles.presetControls}>
+                <select
+                  value={progressionGenre}
+                  onChange={(e) => setProgressionGenre(e.target.value)}
+                  style={{ ...styles.select, width: 120 }}
+                >
+                  {(["All", ...PRESET_GENRES] as const).map((genre) => (
+                    <option key={genre} value={genre}>
+                      {genre}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={progressionMood}
+                  onChange={(e) => setProgressionMood(e.target.value)}
+                  style={{ ...styles.select, width: 120 }}
+                >
+                  {(["All", ...PRESET_MOODS] as const).map((mood) => (
+                    <option key={mood} value={mood}>
+                      {mood}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={progressionComplexity}
+                  onChange={(e) => setProgressionComplexity(e.target.value)}
+                  style={{ ...styles.select, width: 116 }}
+                >
+                  {(["All", ...PRESET_COMPLEXITIES] as const).map(
+                    (complexity) => (
+                      <option key={complexity} value={complexity}>
+                        {complexity === "All" ? "Any C" : `C${complexity}`}
+                      </option>
+                    )
+                  )}
+                </select>
+                <input
+                  value={progressionSearch}
+                  onChange={(e) => setProgressionSearch(e.target.value)}
+                  style={styles.searchInput}
+                  placeholder="search"
+                />
+              </div>
+
+              <div style={styles.presetGrid}>
+                {visiblePresetCards.map(({ preset, romanLabel, chords }) => {
+                  const chordLabel = chords.join(" ");
+                  const presetTags = [
+                    preset.genres[0],
+                    preset.moods[0],
+                    `C${preset.complexity}`,
+                  ]
+                    .filter(Boolean)
+                    .join(" / ");
+                  return (
+                    <div key={preset.id} style={styles.presetItem}>
+                      <button
+                        type="button"
+                        onClick={() => applyProgression(preset)}
+                        style={styles.presetMain}
+                        title={`${preset.description} ${chordLabel}`}
+                      >
+                        <span style={styles.presetName}>{preset.name}</span>
+                        <span style={styles.presetAlias}>{romanLabel}</span>
+                        <span style={styles.presetChords}>{chordLabel}</span>
+                        <span style={styles.presetTags}>{presetTags}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => appendProgression(preset)}
+                        style={styles.presetAppend}
+                        title="Append to chord list"
+                      >
+                        +
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {visibleProgressions.length > visiblePresetCards.length ? (
+                <div style={styles.emptyHint}>
+                  Showing {visiblePresetCards.length} of {visibleProgressions.length}.
+                  Use category or search to narrow.
+                </div>
+              ) : null}
+
+              {visibleProgressions.length === 0 ? (
+                <div style={styles.emptyHint}>No matching presets</div>
+              ) : null}
+            </>
+          ) : null}
+        </section>
+
+        <section style={styles.section}>
+          <div style={styles.workflowHead}>
+            <div>
+              <div style={styles.stepLabel}>2. Your Progression</div>
+              <div style={styles.label}>
+                Chord list（スペース/カンマ区切り → Pad割当）
+                {chordTextPending ? (
+                  <span style={styles.pendingTag}>updating</span>
+                ) : null}
+              </div>
+            </div>
+            <div style={styles.mutedSmall}>Text is the source of truth</div>
           </div>
           <textarea
             value={text}
@@ -1442,20 +1796,156 @@ export default function Page() {
                 {action.label}
               </button>
             ))}
-            <div style={styles.actionSpacer} />
-            {nextChordSuggestions.map((suggestion) => (
-              <button
-                key={`${suggestion.token}-${suggestion.chord}`}
-                type="button"
-                onClick={() => appendNextChord(suggestion.chord)}
-                style={styles.nextButton}
-                title={suggestion.label}
+          </div>
+
+          {chordSymbols.length ? (
+            <div style={styles.progressionChipRow}>
+              {chordSymbols.map((chord, idx) => (
+                <React.Fragment key={`${chord}-${idx}`}>
+                  <button
+                    type="button"
+                    onClick={() => selectChordForSuggestions(idx)}
+                    aria-pressed={
+                      suggestionTarget === "chord" && activeSuggestionIndex === idx
+                    }
+                    style={{
+                      ...styles.chordChip,
+                      ...(suggestionTarget === "chord" &&
+                      activeSuggestionIndex === idx
+                        ? styles.chordChipOn
+                        : {}),
+                    }}
+                    title={`Use ${chord} for suggestions`}
+                  >
+                    <span style={styles.chordChipIndex}>#{idx + 1}</span>
+                    <span>{chord}</span>
+                  </button>
+                  {idx < chordSymbols.length - 1 ? (
+                    <button
+                      type="button"
+                      onClick={() => selectGapForSuggestions(idx)}
+                      aria-pressed={
+                        suggestionTarget === "gap" && activeGapIndex === idx
+                      }
+                      style={{
+                        ...styles.gapMiniButton,
+                        ...(suggestionTarget === "gap" && activeGapIndex === idx
+                          ? styles.gapMiniButtonOn
+                          : {}),
+                      }}
+                      title={`Between ${chord} and ${chordSymbols[idx + 1]}`}
+                    >
+                      ?
+                    </button>
+                  ) : null}
+                </React.Fragment>
+              ))}
+            </div>
+          ) : (
+            <div style={styles.emptyHint}>
+              プリセットを選ぶか、コードを入力するとここに進行が並びます。
+            </div>
+          )}
+        </section>
+
+        <section style={styles.section}>
+          <div style={styles.smartHead}>
+            <div>
+              <div style={styles.stepLabel}>3. Make It Original</div>
+              <div style={styles.label}>Smart chord suggestions</div>
+              <div style={styles.mutedSmall}>
+                {SMART_MODE_HELP[smartMode]}
+              </div>
+            </div>
+
+            <div style={styles.smartControls}>
+              <div style={styles.segmented}>
+                {SMART_MODES.map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    onClick={() => {
+                      setSmartMode(mode);
+                      if (mode === "between") setSuggestionTarget("gap");
+                      if (mode === "next" || mode === "substitute") {
+                        setSuggestionTarget("chord");
+                      }
+                    }}
+                    aria-pressed={smartMode === mode}
+                    style={{
+                      ...styles.segmentButton,
+                      ...(smartMode === mode ? styles.segmentButtonOn : {}),
+                    }}
+                  >
+                    {SMART_MODE_LABELS[mode]}
+                  </button>
+                ))}
+              </div>
+
+              {smartMode === "next" ||
+              smartMode === "substitute" ||
+              (smartMode === "color" && suggestionTarget === "chord") ? (
+                <select
+                  value={activeSuggestionIndex ?? 0}
+                  onChange={(e) => {
+                    setSuggestionTarget("chord");
+                    setSuggestionAnchorIndex(Number(e.target.value));
+                  }}
+                  style={{ ...styles.select, width: 168 }}
+                  disabled={!chordSymbols.length}
+                >
+                  {chordSymbols.length ? (
+                    chordSymbols.map((chord, idx) => (
+                      <option key={`${chord}-${idx}`} value={idx}>
+                        After #{idx + 1} {chord}
+                      </option>
+                    ))
+                  ) : (
+                    <option value={0}>Start from tonic</option>
+                  )}
+                </select>
+              ) : null}
+            </div>
+          </div>
+
+          <div style={styles.contextLine}>{smartContextText}</div>
+
+          <div style={styles.suggestionRows}>
+            {smartSuggestions.map((suggestion) => (
+              <div
+                key={`${smartMode}-${suggestion.roman}-${suggestion.sourceSymbol}`}
+                style={styles.suggestionRow}
               >
-                + {suggestion.chord}
-                <span style={styles.nextTag}>{suggestion.label}</span>
-              </button>
+                <div style={styles.suggestionMain}>
+                  <div style={styles.suggestionTop}>
+                    <span style={styles.smartChord}>{suggestion.symbol}</span>
+                    <span style={styles.smartRoman}>{suggestion.roman}</span>
+                  </div>
+                  <div style={styles.smartMeta}>
+                    <span>{suggestion.label}</span>
+                    <span>{suggestion.category}</span>
+                  </div>
+                  <div style={styles.smartReason}>{suggestion.reason}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => insertSuggestionIntoText(suggestion, smartMode)}
+                  style={styles.smartAction}
+                  title={
+                    suggestion.sourceSymbol !== suggestion.symbol
+                      ? `Writes ${suggestion.sourceSymbol} into the source chord list`
+                      : "Update chord list"
+                  }
+                >
+                  {suggestionActionLabel(suggestion)}
+                </button>
+              </div>
             ))}
           </div>
+
+          {!smartSuggestions.length ? (
+            <div style={styles.emptyHint}>No suggestions yet.</div>
+          ) : null}
         </section>
 
         <section style={styles.section}>
@@ -1509,94 +1999,6 @@ export default function Page() {
               </button>
             </div>
           </div>
-        </section>
-
-        <section style={styles.section}>
-          <div style={styles.progressionHead}>
-            <div>
-              <div style={styles.label}>Progression presets</div>
-              <div style={styles.mutedSmall}>
-                解析キーを基準にコードへ変換します。クリックで置き換え、+で追加。
-              </div>
-            </div>
-            <div style={styles.progressionControls}>
-              <select
-                value={progressionCategory}
-                onChange={(e) =>
-                  setProgressionCategory(
-                    e.target.value as ProgressionCategoryFilter
-                  )
-                }
-                style={{ ...styles.select, width: 120 }}
-              >
-                {(["All", ...PROGRESSION_CATEGORIES] as const).map(
-                  (category) => (
-                    <option key={category} value={category}>
-                      {category}
-                    </option>
-                  )
-                )}
-              </select>
-              <select
-                value={progressionMood}
-                onChange={(e) => setProgressionMood(e.target.value as ProgressionMood)}
-                style={{ ...styles.select, width: 120 }}
-              >
-                {PROGRESSION_MOODS.map((mood) => (
-                  <option key={mood} value={mood}>
-                    {mood}
-                  </option>
-                ))}
-              </select>
-              <input
-                value={progressionSearch}
-                onChange={(e) => setProgressionSearch(e.target.value)}
-                style={styles.searchInput}
-                placeholder="search"
-              />
-              <button
-                type="button"
-                onClick={applyRandomProgression}
-                style={styles.modeButton}
-              >
-                Random
-              </button>
-            </div>
-          </div>
-
-          <div style={styles.progressionGrid}>
-            {visibleProgressions.map((preset) => {
-              const chords = progressionToChords(preset, analysisKey).join(" ");
-              return (
-                <div key={preset.id} style={styles.progressionItem}>
-                  <button
-                    type="button"
-                    onClick={() => applyProgression(preset)}
-                    style={styles.progressionMain}
-                    title={chords}
-                  >
-                    <span style={styles.progressionName}>{preset.name}</span>
-                    <span style={styles.progressionAlias}>{preset.alias}</span>
-                    <span style={styles.progressionChords}>{chords}</span>
-                    <span style={styles.progressionTags}>
-                      {progressionMoods(preset).slice(0, 3).join(" / ")}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => appendProgression(preset)}
-                    style={styles.progressionAppend}
-                    title="Append to chord list"
-                  >
-                    +
-                  </button>
-                </div>
-              );
-            })}
-          </div>
-          {visibleProgressions.length === 0 ? (
-            <div style={styles.emptyHint}>No matching presets</div>
-          ) : null}
         </section>
 
         <section style={styles.sectionRow}>
@@ -2234,8 +2636,22 @@ const styles: Record<string, React.CSSProperties> = {
   sectionRow: { marginTop: 14, display: "flex", gap: 12, flexWrap: "wrap" },
 
   label: { fontSize: 12, fontWeight: 800, marginBottom: 6 },
+  stepLabel: {
+    color: "#0f766e",
+    fontSize: 10,
+    fontWeight: 900,
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    marginBottom: 3,
+  },
   muted: { fontSize: 12, color: "#64748b" },
   mutedSmall: { fontSize: 11, color: "#64748b" },
+  pendingTag: {
+    marginLeft: 8,
+    color: "#0f766e",
+    fontSize: 10,
+    fontWeight: 900,
+  },
 
   row2: { display: "flex", gap: 8 },
   actionRow: {
@@ -2250,6 +2666,67 @@ const styles: Record<string, React.CSSProperties> = {
     height: 24,
     background: "rgba(148,163,184,0.24)",
     margin: "0 2px",
+  },
+  workflowHead: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "end",
+    gap: 12,
+    flexWrap: "wrap",
+    marginBottom: 6,
+  },
+  progressionChipRow: {
+    display: "flex",
+    gap: 6,
+    flexWrap: "wrap",
+    alignItems: "center",
+    marginTop: 10,
+    padding: 8,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.20)",
+    background: "#f8fafc",
+  },
+  chordChip: {
+    height: 32,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#172033",
+    padding: "0 9px",
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: 900,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+  },
+  chordChipOn: {
+    border: "1px solid rgba(20,184,166,0.52)",
+    background: "#ecfeff",
+    color: "#0f766e",
+    boxShadow: "inset 0 -2px 0 rgba(20,184,166,0.20)",
+  },
+  chordChipIndex: {
+    color: "#94a3b8",
+    fontSize: 10,
+    fontFamily: 'system-ui, -apple-system, "SF Pro Text", sans-serif',
+  },
+  gapMiniButton: {
+    width: 28,
+    height: 28,
+    borderRadius: 8,
+    border: "1px dashed rgba(148,163,184,0.42)",
+    background: "#ffffff",
+    color: "#64748b",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 13,
+  },
+  gapMiniButtonOn: {
+    border: "1px solid rgba(20,184,166,0.52)",
+    background: "#f0fdfa",
+    color: "#0f766e",
   },
   pillButton: {
     height: 28,
@@ -2473,7 +2950,7 @@ const styles: Record<string, React.CSSProperties> = {
     fontWeight: 800,
   },
 
-  progressionHead: {
+  presetHead: {
     display: "flex",
     alignItems: "end",
     justifyContent: "space-between",
@@ -2481,12 +2958,13 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: 10,
     flexWrap: "wrap",
   },
-  progressionControls: {
+  presetControls: {
     display: "flex",
     gap: 8,
     alignItems: "center",
     flexWrap: "wrap",
     justifyContent: "flex-end",
+    marginBottom: 8,
   },
   searchInput: {
     width: 120,
@@ -2498,18 +2976,18 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "0 10px",
     fontSize: 12,
   },
-  progressionGrid: {
+  presetGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
     gap: 8,
   },
-  progressionItem: {
+  presetItem: {
     display: "grid",
     gridTemplateColumns: "1fr 34px",
     gap: 6,
   },
-  progressionMain: {
-    minHeight: 76,
+  presetMain: {
+    minHeight: 74,
     borderRadius: 8,
     border: "1px solid rgba(148,163,184,0.24)",
     background: "#ffffff",
@@ -2520,17 +2998,17 @@ const styles: Record<string, React.CSSProperties> = {
     display: "grid",
     gap: 3,
   },
-  progressionName: {
+  presetName: {
     fontSize: 12,
     fontWeight: 900,
   },
-  progressionAlias: {
+  presetAlias: {
     color: "#0f766e",
     fontSize: 11,
     fontFamily: "Menlo, Monaco, Consolas, monospace",
     fontWeight: 900,
   },
-  progressionChords: {
+  presetChords: {
     color: "#64748b",
     fontSize: 11,
     fontFamily: "Menlo, Monaco, Consolas, monospace",
@@ -2538,7 +3016,7 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: "hidden",
     textOverflow: "ellipsis",
   },
-  progressionTags: {
+  presetTags: {
     color: "#94a3b8",
     fontSize: 10,
     fontWeight: 800,
@@ -2546,7 +3024,7 @@ const styles: Record<string, React.CSSProperties> = {
     overflow: "hidden",
     textOverflow: "ellipsis",
   },
-  progressionAppend: {
+  presetAppend: {
     borderRadius: 8,
     border: "1px solid rgba(20,184,166,0.34)",
     background: "#ecfeff",
@@ -2554,6 +3032,173 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     fontWeight: 900,
     fontSize: 18,
+  },
+
+  smartHead: {
+    display: "flex",
+    alignItems: "end",
+    justifyContent: "space-between",
+    gap: 12,
+    marginBottom: 10,
+    flexWrap: "wrap",
+  },
+  smartControls: {
+    display: "flex",
+    gap: 8,
+    alignItems: "center",
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+  },
+  segmented: {
+    display: "inline-flex",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    overflow: "hidden",
+  },
+  segmentButton: {
+    height: 34,
+    padding: "0 12px",
+    border: 0,
+    borderRight: "1px solid rgba(148,163,184,0.22)",
+    background: "#ffffff",
+    color: "#64748b",
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: 900,
+  },
+  segmentButtonOn: {
+    background: "#ecfeff",
+    color: "#0f766e",
+    boxShadow: "inset 0 -2px 0 rgba(20,184,166,0.28)",
+  },
+  contextLine: {
+    marginBottom: 8,
+    borderRadius: 8,
+    border: "1px solid rgba(20,184,166,0.20)",
+    background: "#f0fdfa",
+    color: "#115e59",
+    padding: "8px 10px",
+    fontSize: 12,
+    fontWeight: 900,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+  },
+  gapRow: {
+    display: "flex",
+    gap: 8,
+    flexWrap: "wrap",
+    marginBottom: 10,
+  },
+  gapButton: {
+    height: 34,
+    maxWidth: 220,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#172033",
+    padding: "0 9px",
+    cursor: "pointer",
+    fontSize: 12,
+    fontWeight: 900,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    whiteSpace: "nowrap",
+  },
+  gapButtonOn: {
+    border: "1px solid rgba(20,184,166,0.48)",
+    background: "#f0fdfa",
+    color: "#0f766e",
+  },
+  gapArrow: {
+    color: "#94a3b8",
+    fontWeight: 900,
+  },
+  smartGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
+    gap: 8,
+  },
+  suggestionRows: {
+    display: "grid",
+    gap: 8,
+  },
+  suggestionRow: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) auto",
+    gap: 10,
+    alignItems: "center",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "#ffffff",
+    color: "#172033",
+    padding: 10,
+  },
+  suggestionMain: {
+    minWidth: 0,
+    display: "grid",
+    gap: 4,
+  },
+  suggestionTop: {
+    display: "flex",
+    gap: 8,
+    alignItems: "baseline",
+    flexWrap: "wrap",
+  },
+  smartCard: {
+    display: "grid",
+    gridTemplateRows: "auto auto 1fr auto",
+    gap: 6,
+    minHeight: 126,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.24)",
+    background: "#ffffff",
+    color: "#172033",
+    padding: 10,
+  },
+  smartCardTop: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: 8,
+    alignItems: "baseline",
+  },
+  smartChord: {
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 18,
+    fontWeight: 900,
+    color: "#172033",
+  },
+  smartRoman: {
+    color: "#0f766e",
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 12,
+    fontWeight: 900,
+  },
+  smartMeta: {
+    display: "flex",
+    gap: 6,
+    flexWrap: "wrap",
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: 900,
+  },
+  smartReason: {
+    color: "#334155",
+    fontSize: 11,
+    fontWeight: 800,
+    lineHeight: 1.35,
+  },
+  smartAction: {
+    height: 30,
+    borderRadius: 8,
+    border: "1px solid rgba(20,184,166,0.34)",
+    background: "#ecfeff",
+    color: "#0f766e",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 12,
   },
   emptyHint: {
     marginTop: 8,

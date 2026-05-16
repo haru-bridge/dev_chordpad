@@ -100,6 +100,21 @@ type ChordTonePcs = {
   thirteenth: string | null;
 };
 
+const PARSE_CACHE_LIMIT = 512;
+const parsedChordCache = new Map<string, Parsed | null>();
+
+function cacheParsedChord(key: string, build: () => Parsed | null): Parsed | null {
+  if (parsedChordCache.has(key)) return parsedChordCache.get(key) ?? null;
+
+  const value = build();
+  parsedChordCache.set(key, value);
+  if (parsedChordCache.size > PARSE_CACHE_LIMIT) {
+    const oldest = parsedChordCache.keys().next().value;
+    if (oldest !== undefined) parsedChordCache.delete(oldest);
+  }
+  return value;
+}
+
 function splitSlash(input: string): { core: string; slash?: string } {
   const m = input.trim().match(/^(.+?)\s*\/\s*([A-Ga-g][b#]?)$/);
   if (!m) return { core: input.trim() };
@@ -124,25 +139,28 @@ function guessQuality(symbol: string, tonalQuality?: string): Parsed["qualityGue
 }
 
 function parseChordSymbol(input: string): Parsed | null {
-  const { core, slash } = splitSlash(input);
-  const c = Chord.get(core);
-  if (!c?.tonic) return null;
+  const cacheKey = input.trim().replace(/♭/g, "b").replace(/♯/g, "#");
+  return cacheParsedChord(cacheKey, () => {
+    const { core, slash } = splitSlash(input);
+    const c = Chord.get(core);
+    if (!c?.tonic) return null;
 
-  const tonic = normalizePc(c.tonic);
-  const notes = (c.notes ?? []).map(normalizePc);
-  const intervals = c.intervals ?? [];
-  const tones = buildChordTonePcs(tonic, intervals, notes);
+    const tonic = normalizePc(c.tonic);
+    const notes = (c.notes ?? []).map(normalizePc);
+    const intervals = c.intervals ?? [];
+    const tones = buildChordTonePcs(tonic, intervals, notes);
 
-  return {
-    core,
-    slashBass: slash,
-    tonic,
-    notes,
-    intervals,
-    tones,
-    toneLabels: intervals.map(intervalLabel),
-    qualityGuess: guessQuality(core, c.quality),
-  };
+    return {
+      core,
+      slashBass: slash,
+      tonic,
+      notes,
+      intervals,
+      tones,
+      toneLabels: intervals.map(intervalLabel),
+      qualityGuess: guessQuality(core, c.quality),
+    };
+  });
 }
 
 function intervalNum(interval: string): number | null {
