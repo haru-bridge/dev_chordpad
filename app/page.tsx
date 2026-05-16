@@ -52,6 +52,12 @@ import {
   type ChordTransformId,
 } from "../lib/chordActions";
 import { buildChordMidiFile } from "../lib/midiExport";
+import {
+  extractChordChart,
+  extractChordSymbols,
+  extractOcrChordChart,
+  normalizeChordInputText,
+} from "../lib/chordChartImport";
 
 import {
   buildNoteEvents,
@@ -66,6 +72,7 @@ import {
   recommendColorOptions,
   recommendExtensions,
   recommendNextChord,
+  romanCandidateToChord,
   recommendSubstitutions,
   type ChordSuggestion,
 } from "../lib/chordRecommendations";
@@ -125,13 +132,14 @@ type KeyMode = "major" | "minor";
 type SmartSuggestionMode = "between" | "next" | "substitute" | "extend" | "color";
 type SmartSuggestionTarget = "chord" | "gap";
 type PresetDisplayMode = "both" | "chords" | "roman";
+type OcrStatus = "idle" | "loading" | "preparing" | "reading" | "done" | "error";
 
 function nowStr() {
   return new Date().toLocaleTimeString();
 }
 
 function chordListFromText(value: string) {
-  return value
+  return normalizeChordInputText(value)
     .split(/[\s,]+/)
     .map((s) => s.trim())
     .filter(Boolean)
@@ -139,6 +147,41 @@ function chordListFromText(value: string) {
 }
 
 const SMART_MODES = ["between", "next", "substitute", "extend", "color"] as const;
+const OCR_CHAR_WHITELIST =
+  "ABCDEFGabcdefg0123456789#b/|() -+majMinsudoghtIlTN.C\n";
+const OCR_TARGET_LONG_EDGE = 1800;
+const OCR_MAX_LONG_EDGE = 2400;
+const OCR_MAX_UPSCALE = 2;
+
+const QUICK_CHORD_ROMANS: Record<KeyMode, readonly string[]> = {
+  major: [
+    "I",
+    "ii",
+    "iii",
+    "IV",
+    "V",
+    "vi",
+    "V7",
+    "ii7",
+    "IVmaj7",
+    "V/vi",
+    "V/V",
+    "iv",
+    "bVII",
+  ],
+  minor: [
+    "i",
+    "bIII",
+    "iv",
+    "V",
+    "V7",
+    "bVI",
+    "bVII",
+    "iiø",
+    "V/iv",
+    "V/V",
+  ],
+};
 
 const SMART_MODE_LABELS: Record<SmartSuggestionMode, string> = {
   between: "Between",
@@ -161,6 +204,89 @@ function suggestionActionLabel(suggestion: ChordSuggestion) {
   if (suggestion.action === "insert") return "Insert";
   if (suggestion.action === "extend") return "Add";
   return "+";
+}
+
+type OcrDrawableImage = ImageBitmap | HTMLImageElement;
+
+async function loadOcrImage(file: File): Promise<OcrDrawableImage> {
+  if (typeof window !== "undefined" && "createImageBitmap" in window) {
+    return window.createImageBitmap(file);
+  }
+
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(image);
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("Image could not be loaded"));
+    };
+    image.src = url;
+  });
+}
+
+function ocrImageSize(image: OcrDrawableImage) {
+  if (image instanceof HTMLImageElement) {
+    return {
+      width: image.naturalWidth || image.width,
+      height: image.naturalHeight || image.height,
+    };
+  }
+  return { width: image.width, height: image.height };
+}
+
+async function preprocessImageForOcr(file: File): Promise<Blob | File> {
+  const image = await loadOcrImage(file);
+
+  try {
+    const sourceSize = ocrImageSize(image);
+    const longEdge = Math.max(sourceSize.width, sourceSize.height);
+    if (!longEdge) return file;
+
+    const targetLongEdge =
+      longEdge < OCR_TARGET_LONG_EDGE
+        ? OCR_TARGET_LONG_EDGE
+        : Math.min(longEdge, OCR_MAX_LONG_EDGE);
+    const scale = Math.min(OCR_MAX_UPSCALE, targetLongEdge / longEdge);
+    const width = Math.max(1, Math.round(sourceSize.width * scale));
+    const height = Math.max(1, Math.round(sourceSize.height * scale));
+
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    if (!ctx) return file;
+
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, width, height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = "high";
+    ctx.drawImage(image, 0, 0, width, height);
+
+    const data = ctx.getImageData(0, 0, width, height);
+    const pixels = data.data;
+    for (let idx = 0; idx < pixels.length; idx += 4) {
+      const gray =
+        pixels[idx] * 0.299 + pixels[idx + 1] * 0.587 + pixels[idx + 2] * 0.114;
+      const contrast = Math.max(0, Math.min(255, (gray - 128) * 1.65 + 128));
+      const value = contrast < 205 ? 0 : 255;
+      pixels[idx] = value;
+      pixels[idx + 1] = value;
+      pixels[idx + 2] = value;
+      pixels[idx + 3] = 255;
+    }
+    ctx.putImageData(data, 0, 0);
+
+    const blob = await new Promise<Blob | null>((resolve) =>
+      canvas.toBlob(resolve, "image/png")
+    );
+    return blob ?? file;
+  } finally {
+    if ("close" in image) image.close();
+  }
 }
 
 type HoldState = {
@@ -219,6 +345,11 @@ export default function Page() {
   >(null);
   const [suggestionGapIndex, setSuggestionGapIndex] = useState(0);
   const [shareStatus, setShareStatus] = useState("");
+  const [fastInputOpen, setFastInputOpen] = useState(true);
+  const [chartImportOpen, setChartImportOpen] = useState(false);
+  const [chartImportText, setChartImportText] = useState("");
+  const [ocrStatus, setOcrStatus] = useState<OcrStatus>("idle");
+  const [ocrError, setOcrError] = useState("");
 
   // --- per pad preset ---
   const [padPresets, setPadPresets] = useState<PadVoicingPreset[]>(() =>
@@ -640,6 +771,40 @@ export default function Page() {
     [romanContext]
   );
 
+  const quickChordButtons = useMemo(
+    () =>
+      QUICK_CHORD_ROMANS[analysisMode].map((roman) => ({
+        roman,
+        symbol: romanCandidateToChord(roman, {
+          key: analysisRoot,
+          mode: analysisMode,
+        }),
+      })),
+    [analysisMode, analysisRoot]
+  );
+
+  const recentChordButtons = useMemo(() => {
+    const seen = new Set<string>();
+    const recent: string[] = [];
+    for (const chord of [...chordSymbols].reverse()) {
+      if (seen.has(chord)) continue;
+      seen.add(chord);
+      recent.push(chord);
+      if (recent.length >= 8) break;
+    }
+    return recent;
+  }, [chordSymbols]);
+
+  const chartImport = useMemo(
+    () => extractChordChart(chartImportText, { maxChords: 64 }),
+    [chartImportText]
+  );
+
+  const chartImportPreview = useMemo(
+    () => chartImport.chords.slice(0, MAX_PADS).join(" "),
+    [chartImport.chords]
+  );
+
   useEffect(() => {
     setPresetVisibleCount(PRESET_RENDER_LIMIT);
   }, [
@@ -755,6 +920,98 @@ export default function Page() {
     if (!currentChords.length) return;
     setText(transformChordSymbols(currentChords, transform).join(" "));
     setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
+  };
+
+  const replaceWithChordSymbols = (symbols: string[]) => {
+    const next = symbols.slice(0, MAX_PADS);
+    if (!next.length) return;
+    setText(next.join(" "));
+    setPadPresets(Array.from({ length: MAX_PADS }, () => "AUTO_VOICE_BASS"));
+    setSmartMode("next");
+    setSuggestionTarget("chord");
+    setSuggestionAnchorIndex(null);
+    setSuggestionGapIndex(0);
+  };
+
+  const appendChordSymbols = (symbols: string[]) => {
+    if (!symbols.length) return;
+    setText((prev) => {
+      const merged = [...chordListFromText(prev), ...symbols].slice(0, MAX_PADS);
+      return merged.join(" ");
+    });
+    setSmartMode("next");
+    setSuggestionTarget("chord");
+    setSuggestionAnchorIndex(null);
+  };
+
+  const cleanCurrentChordText = () => {
+    const extracted = extractChordSymbols(text, { maxChords: MAX_PADS });
+    const fallback = chordListFromText(text);
+    const next = extracted.length ? extracted : fallback;
+    if (next.length) setText(next.join(" "));
+  };
+
+  const applyChartImport = (mode: "replace" | "append") => {
+    const symbols = chartImport.chords.slice(0, MAX_PADS);
+    if (!symbols.length) return;
+    if (mode === "replace") replaceWithChordSymbols(symbols);
+    else appendChordSymbols(symbols);
+  };
+
+  const runOcrFromImage = async (file: File) => {
+    if (!file.type.startsWith("image/")) return;
+
+    setOcrStatus("loading");
+    setOcrError("");
+    let worker: Awaited<
+      ReturnType<typeof import("tesseract.js")["createWorker"]>
+    > | null = null;
+
+    try {
+      const { createWorker, PSM } = await import("tesseract.js");
+      setOcrStatus("preparing");
+      const preparedImage = await preprocessImageForOcr(file);
+
+      setOcrStatus("reading");
+      worker = await createWorker("eng");
+      await worker.setParameters({
+        tessedit_pageseg_mode: PSM.SPARSE_TEXT,
+        tessedit_char_whitelist: OCR_CHAR_WHITELIST,
+        preserve_interword_spaces: "1",
+        user_defined_dpi: "300",
+      });
+      const result = await worker.recognize(preparedImage);
+      const rawText = result.data.text ?? "";
+      const extracted = extractOcrChordChart(rawText, { maxChords: 64 });
+      setChartImportText(extracted.text || rawText);
+      setChartImportOpen(true);
+      setFastInputOpen(true);
+      setOcrStatus("done");
+    } catch (error) {
+      setOcrStatus("error");
+      setOcrError(error instanceof Error ? error.message : "OCR failed");
+    } finally {
+      await worker?.terminate();
+    }
+  };
+
+  const handleOcrFileChange = async (
+    event: React.ChangeEvent<HTMLInputElement>
+  ) => {
+    const file = event.target.files?.[0];
+    event.currentTarget.value = "";
+    if (file) await runOcrFromImage(file);
+  };
+
+  const handleChartImportPaste = async (
+    event: React.ClipboardEvent<HTMLTextAreaElement>
+  ) => {
+    const image = Array.from(event.clipboardData.files).find((file) =>
+      file.type.startsWith("image/")
+    );
+    if (!image) return;
+    event.preventDefault();
+    await runOcrFromImage(image);
   };
 
   const lastRoman = romanContext[romanContext.length - 1] ?? "";
@@ -2049,6 +2306,160 @@ export default function Page() {
             placeholder="例: Dbm7 C7 Fm7 Bb7 ..."
           />
 
+          <div style={styles.fastInputBox}>
+            <div style={styles.fastInputHead}>
+              <div>
+                <div style={styles.label}>Fast input</div>
+                <div style={styles.mutedSmall}>
+                  Source {analysisRoot} {analysisMode} → Sounding {playRoot}{" "}
+                  {playMode}
+                </div>
+              </div>
+              <div style={styles.fastInputActions}>
+                <button
+                  type="button"
+                  onClick={() => setFastInputOpen((v) => !v)}
+                  aria-expanded={fastInputOpen}
+                  style={styles.modeButton}
+                >
+                  {fastInputOpen ? "Hide" : "Show"}
+                </button>
+                <button
+                  type="button"
+                  onClick={cleanCurrentChordText}
+                  style={styles.modeButton}
+                  title="Extract chord-like symbols from the current text"
+                >
+                  Clean text
+                </button>
+                <label style={styles.modeButton} title="Read chords from image">
+                  OCR image
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={handleOcrFileChange}
+                    style={styles.hiddenFileInput}
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() => setChartImportOpen((v) => !v)}
+                  style={{
+                    ...styles.modeButton,
+                    ...(chartImportOpen ? styles.modeButtonOn : {}),
+                  }}
+                >
+                  Paste chart
+                </button>
+              </div>
+            </div>
+
+            {fastInputOpen ? (
+              <>
+                <div style={styles.fastInputGrid}>
+                  <div style={styles.fastInputPanel}>
+                    <div style={styles.fastInputPanelHead}>Quick add</div>
+                    <div style={styles.quickChordRow}>
+                      {quickChordButtons.map((item) => (
+                        <button
+                          key={item.roman}
+                          type="button"
+                          onClick={() => appendChordToText(item.symbol)}
+                          style={styles.quickChordButton}
+                          title={`Add ${item.roman}`}
+                        >
+                          <span>{item.symbol}</span>
+                          <span style={styles.quickChordRoman}>{item.roman}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={styles.fastInputPanel}>
+                    <div style={styles.fastInputPanelHead}>Recent</div>
+                    {recentChordButtons.length ? (
+                      <div style={styles.quickChordRow}>
+                        {recentChordButtons.map((chord) => (
+                          <button
+                            key={chord}
+                            type="button"
+                            onClick={() => appendChordToText(chord)}
+                            style={styles.recentChordButton}
+                          >
+                            {chord}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={styles.mutedSmall}>
+                        入力したコードがここに並びます。
+                      </div>
+                    )}
+                    <div style={styles.ocrStatus}>
+                      {ocrStatus === "loading"
+                        ? "Loading OCR..."
+                        : ocrStatus === "preparing"
+                          ? "Preparing image..."
+                        : ocrStatus === "reading"
+                          ? "Reading image..."
+                          : ocrStatus === "done"
+                            ? `OCR result is ready below. ${chartImport.chords.length} chord(s) detected.`
+                            : ocrStatus === "error"
+                              ? `OCR failed: ${ocrError}`
+                              : "画像は選択または貼り付け時だけOCRします。"}
+                    </div>
+                  </div>
+                </div>
+
+                {chartImportOpen ? (
+                  <div style={styles.chartImportPanel}>
+                    <textarea
+                      value={chartImportText}
+                      onChange={(e) => setChartImportText(e.target.value)}
+                      onPaste={handleChartImportPaste}
+                      rows={4}
+                      style={styles.importTextarea}
+                      placeholder="コード譜テキストを貼るか、ここに画像を貼り付けます。例: G D Em7 Bm7 / C on D"
+                    />
+                    <div style={styles.importPreviewRow}>
+                      <div style={styles.importPreview}>
+                        {chartImportPreview || "No chords detected yet."}
+                      </div>
+                      <div style={styles.fastInputActions}>
+                        <button
+                          type="button"
+                          onClick={() => applyChartImport("replace")}
+                          disabled={!chartImport.chords.length}
+                          style={{
+                            ...styles.presetActionButton,
+                            opacity: chartImport.chords.length ? 1 : 0.45,
+                          }}
+                        >
+                          Use
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => applyChartImport("append")}
+                          disabled={!chartImport.chords.length}
+                          style={{
+                            ...styles.presetActionButton,
+                            opacity: chartImport.chords.length ? 1 : 0.45,
+                          }}
+                        >
+                          Append
+                        </button>
+                      </div>
+                    </div>
+                    <div style={styles.mutedSmall}>
+                      Detected {chartImport.chords.length} chord(s). The first{" "}
+                      {MAX_PADS} are used for pads.
+                    </div>
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+          </div>
+
           <div style={styles.actionRow}>
             {CHORD_TRANSFORMS.map((action) => (
               <button
@@ -3054,6 +3465,128 @@ const styles: Record<string, React.CSSProperties> = {
     padding: 10,
     fontFamily: "Menlo, Monaco, Consolas, monospace",
     fontSize: 13,
+  },
+  fastInputBox: {
+    marginTop: 8,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.22)",
+    background: "#f8fafc",
+    padding: 10,
+  },
+  fastInputHead: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "end",
+    gap: 10,
+    flexWrap: "wrap",
+  },
+  fastInputActions: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "flex-end",
+    gap: 6,
+    flexWrap: "wrap",
+  },
+  fastInputGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))",
+    gap: 8,
+    marginTop: 10,
+  },
+  fastInputPanel: {
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.20)",
+    background: "#ffffff",
+    padding: 9,
+    minWidth: 0,
+  },
+  fastInputPanelHead: {
+    color: "#334155",
+    fontSize: 11,
+    fontWeight: 900,
+    marginBottom: 7,
+  },
+  quickChordRow: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 6,
+  },
+  quickChordButton: {
+    height: 32,
+    borderRadius: 8,
+    border: "1px solid rgba(20,184,166,0.28)",
+    background: "#ecfeff",
+    color: "#115e59",
+    cursor: "pointer",
+    padding: "0 9px",
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 12,
+    fontWeight: 900,
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
+  },
+  quickChordRoman: {
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: 900,
+  },
+  recentChordButton: {
+    height: 30,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#172033",
+    cursor: "pointer",
+    padding: "0 9px",
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 12,
+    fontWeight: 900,
+  },
+  ocrStatus: {
+    marginTop: 8,
+    color: "#64748b",
+    fontSize: 11,
+    fontWeight: 800,
+    minHeight: 15,
+  },
+  chartImportPanel: {
+    marginTop: 8,
+    display: "grid",
+    gap: 8,
+  },
+  importTextarea: {
+    width: "100%",
+    background: "#ffffff",
+    color: "#172033",
+    border: "1px solid rgba(148,163,184,0.30)",
+    borderRadius: 8,
+    padding: 10,
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 12,
+  },
+  importPreviewRow: {
+    display: "grid",
+    gridTemplateColumns: "minmax(0, 1fr) auto",
+    gap: 8,
+    alignItems: "center",
+  },
+  importPreview: {
+    minHeight: 34,
+    borderRadius: 8,
+    border: "1px solid rgba(20,184,166,0.20)",
+    background: "#f0fdfa",
+    color: "#115e59",
+    padding: "8px 10px",
+    fontFamily: "Menlo, Monaco, Consolas, monospace",
+    fontSize: 12,
+    fontWeight: 900,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  hiddenFileInput: {
+    display: "none",
   },
   select: {
     width: "100%",
