@@ -240,12 +240,14 @@ describe("chord recommendation engine", () => {
 
 describe("roman progression presets", () => {
   it("keeps a balanced data-driven starter library", () => {
-    expect(STARTER_PRESETS.length).toBeGreaterThanOrEqual(40);
-    expect(STARTER_PRESETS.length).toBeLessThanOrEqual(60);
+    expect(STARTER_PRESETS.length).toBeGreaterThanOrEqual(80);
+    expect(STARTER_PRESETS.length).toBeLessThanOrEqual(120);
     for (const preset of STARTER_PRESETS) {
       expect(preset.roman.length).toBeGreaterThan(0);
       expect(preset.genres.length).toBeGreaterThan(0);
       expect(preset.moods.length).toBeGreaterThan(0);
+      expect(preset.useCases.length).toBeGreaterThan(0);
+      expect(preset.category).toEqual(expect.any(String));
     }
   });
 
@@ -264,11 +266,28 @@ describe("roman progression presets", () => {
   it("filters presets by genre, mood, complexity, and search", () => {
     const results = filterProgressionPresets(STARTER_PRESETS, {
       genre: "Anime",
-      mood: "Emotional",
+      mood: "emotional",
       complexity: "2",
-      search: "royal",
+      search: "staple",
     });
 
     expect(results.map((preset) => preset.id)).toEqual(["royal-road"]);
+  });
+
+  it("filters presets by category, use case, and converted chord search", () => {
+    const results = filterProgressionPresets(
+      STARTER_PRESETS,
+      {
+        category: "I-start",
+        useCase: "chorus",
+        search: "D A Bm G",
+      },
+      {
+        convertedChords: (preset) =>
+          progressionPresetToChords(preset, { key: "D", mode: "major" }),
+      }
+    );
+
+    expect(results.map((preset) => preset.id)).toContain("axis");
   });
 });

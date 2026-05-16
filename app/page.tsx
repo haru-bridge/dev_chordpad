@@ -35,9 +35,12 @@ import {
 } from "../lib/progressions";
 import {
   filterProgressionPresets,
+  PRESET_CATEGORIES,
+  PRESET_CATEGORY_LABELS,
   PRESET_COMPLEXITIES,
   PRESET_GENRES,
   PRESET_MOODS,
+  PRESET_USE_CASES,
   progressionPresetRomanLabel,
   progressionPresetToChords,
   STARTER_PRESETS,
@@ -121,6 +124,7 @@ type KeyRoot = (typeof KEY_ROOTS)[number];
 type KeyMode = "major" | "minor";
 type SmartSuggestionMode = "between" | "next" | "substitute" | "extend" | "color";
 type SmartSuggestionTarget = "chord" | "gap";
+type PresetDisplayMode = "both" | "chords" | "roman";
 
 function nowStr() {
   return new Date().toLocaleTimeString();
@@ -192,10 +196,18 @@ export default function Page() {
   const [instrument, setInstrument] = useState<InstrumentId>("soft_keys");
   const [latchMode, setLatchMode] = useState(false);
   const [sustainDown, setSustainDown] = useState(false);
+  const [progressionCategory, setProgressionCategory] = useState("All");
   const [progressionGenre, setProgressionGenre] = useState("All");
   const [progressionMood, setProgressionMood] = useState("All");
+  const [progressionUseCase, setProgressionUseCase] = useState("All");
   const [progressionComplexity, setProgressionComplexity] = useState("All");
   const [progressionSearch, setProgressionSearch] = useState("");
+  const [presetDisplayMode, setPresetDisplayMode] =
+    useState<PresetDisplayMode>("both");
+  const [presetVisibleCount, setPresetVisibleCount] =
+    useState(PRESET_RENDER_LIMIT);
+  const [previewPresetId, setPreviewPresetId] = useState<string | null>(null);
+  const [copiedPresetId, setCopiedPresetId] = useState<string | null>(null);
   const [presetPanelOpen, setPresetPanelOpen] = useState(true);
   const [sectionBars, setSectionBars] = useState(8);
   const [sectionShape, setSectionShape] = useState<SectionShapeId>("story");
@@ -272,6 +284,7 @@ export default function Page() {
   const holdMidisRef = useRef<Record<number, number[]>>({});
   const oneShotMidisRef = useRef<number[]>([]);
   const oneShotTimerRef = useRef<number | null>(null);
+  const previewTimerRef = useRef<number | null>(null);
 
   const rafSyncRef = useRef<number | null>(null);
   const requestSyncActiveMidis = () => {
@@ -477,6 +490,14 @@ export default function Page() {
         setLatchMode(saved.latchMode);
       }
       if (
+        saved.progressionCategory === "All" ||
+        PRESET_CATEGORIES.includes(
+          saved.progressionCategory as (typeof PRESET_CATEGORIES)[number]
+        )
+      ) {
+        setProgressionCategory(saved.progressionCategory as string);
+      }
+      if (
         saved.progressionGenre === "All" ||
         PRESET_GENRES.includes(saved.progressionGenre as string)
       ) {
@@ -489,6 +510,12 @@ export default function Page() {
         setProgressionMood(saved.progressionMood as string);
       }
       if (
+        saved.progressionUseCase === "All" ||
+        PRESET_USE_CASES.includes(saved.progressionUseCase as string)
+      ) {
+        setProgressionUseCase(saved.progressionUseCase as string);
+      }
+      if (
         saved.progressionComplexity === "All" ||
         PRESET_COMPLEXITIES.includes(
           saved.progressionComplexity as (typeof PRESET_COMPLEXITIES)[number]
@@ -498,6 +525,13 @@ export default function Page() {
       }
       if (typeof saved.progressionSearch === "string") {
         setProgressionSearch(saved.progressionSearch);
+      }
+      if (
+        saved.presetDisplayMode === "both" ||
+        saved.presetDisplayMode === "chords" ||
+        saved.presetDisplayMode === "roman"
+      ) {
+        setPresetDisplayMode(saved.presetDisplayMode);
       }
       if (typeof saved.sectionBars === "number") {
         const bars = [4, 8, 12, 16].includes(saved.sectionBars)
@@ -559,10 +593,13 @@ export default function Page() {
           voiceLead,
           instrument,
           latchMode,
+          progressionCategory,
           progressionGenre,
           progressionMood,
+          progressionUseCase,
           progressionComplexity,
           progressionSearch,
+          presetDisplayMode,
           sectionBars,
           sectionShape,
           padPresets,
@@ -584,10 +621,13 @@ export default function Page() {
     voiceLead,
     instrument,
     latchMode,
+    progressionCategory,
     progressionGenre,
     progressionMood,
+    progressionUseCase,
     progressionComplexity,
     progressionSearch,
+    presetDisplayMode,
     sectionBars,
     sectionShape,
     padPresets,
@@ -600,18 +640,51 @@ export default function Page() {
     [romanContext]
   );
 
+  useEffect(() => {
+    setPresetVisibleCount(PRESET_RENDER_LIMIT);
+  }, [
+    analysisMode,
+    analysisRoot,
+    progressionCategory,
+    progressionComplexity,
+    progressionGenre,
+    progressionMood,
+    progressionSearch,
+    progressionUseCase,
+  ]);
+
   const visibleProgressions = useMemo(() => {
+    const includeConvertedChords = progressionSearch.trim().length > 0;
     return filterProgressionPresets(STARTER_PRESETS, {
+      category: progressionCategory,
       genre: progressionGenre,
       mood: progressionMood,
+      useCase: progressionUseCase,
       complexity: progressionComplexity,
       search: progressionSearch,
+    }, {
+      convertedChords: includeConvertedChords
+        ? (preset) =>
+            progressionPresetToChords(preset, {
+              key: analysisRoot,
+              mode: analysisMode,
+            })
+        : undefined,
     });
-  }, [progressionComplexity, progressionGenre, progressionMood, progressionSearch]);
+  }, [
+    analysisMode,
+    analysisRoot,
+    progressionCategory,
+    progressionComplexity,
+    progressionGenre,
+    progressionMood,
+    progressionSearch,
+    progressionUseCase,
+  ]);
 
   const visiblePresetCards = useMemo(() => {
     if (!presetPanelOpen) return [];
-    return visibleProgressions.slice(0, PRESET_RENDER_LIMIT).map((preset) => ({
+    return visibleProgressions.slice(0, presetVisibleCount).map((preset) => ({
       preset,
       romanLabel: progressionPresetRomanLabel(preset),
       chords: progressionPresetToChords(preset, {
@@ -619,7 +692,13 @@ export default function Page() {
         mode: analysisMode,
       }),
     }));
-  }, [analysisMode, analysisRoot, presetPanelOpen, visibleProgressions]);
+  }, [
+    analysisMode,
+    analysisRoot,
+    presetPanelOpen,
+    presetVisibleCount,
+    visibleProgressions,
+  ]);
 
   const applyProgression = (preset: StarterProgressionPreset) => {
     const next = progressionPresetToChords(preset, {
@@ -646,6 +725,21 @@ export default function Page() {
     setSmartMode("next");
     setSuggestionTarget("chord");
     setSuggestionAnchorIndex(null);
+  };
+
+  const copyProgression = async (preset: StarterProgressionPreset) => {
+    const chords = progressionPresetToChords(preset, {
+      key: analysisRoot,
+      mode: analysisMode,
+    }).join(" ");
+
+    try {
+      await navigator.clipboard.writeText(chords);
+      setCopiedPresetId(preset.id);
+      window.setTimeout(() => setCopiedPresetId(null), 1200);
+    } catch {
+      setCopiedPresetId(null);
+    }
   };
 
   const applyRandomProgression = () => {
@@ -1030,6 +1124,70 @@ export default function Page() {
     audioReadyRef.current = true;
   };
 
+  const clearPreviewState = () => {
+    if (previewTimerRef.current !== null) {
+      window.clearTimeout(previewTimerRef.current);
+      previewTimerRef.current = null;
+    }
+    setPreviewPresetId(null);
+  };
+
+  const playProgressionPreview = async (preset: StarterProgressionPreset) => {
+    const chords = progressionPresetToChords(preset, {
+      key: analysisRoot,
+      mode: analysisMode,
+    }).slice(0, MAX_PADS);
+    if (!chords.length) return;
+
+    await ensureAudioReady();
+    const Tone = toneRef.current;
+    const synth = await ensureSynth();
+    if (!Tone) return;
+
+    clearPreviewState();
+    setPreviewPresetId(preset.id);
+
+    let previousMidis: number[] = [];
+    const startAt = Tone.now() + 0.035;
+    const chordStepSec = 0.58;
+    const releaseSec = 0.44;
+
+    chords.forEach((chord, chordIndex) => {
+      const voicing = buildPadVoicing(
+        chord,
+        centerOctave,
+        "AUTO_VOICE_BASS",
+        shift
+      );
+      if (!voicing?.midis.length) return;
+
+      const rawMidis = voiceLead
+        ? smoothVoiceLead(previousMidis, voicing.midis)
+        : voicing.midis;
+      const midis = normalizePadRange(rawMidis, centerOctave);
+      if (!midis.length) return;
+      previousMidis = midis;
+
+      const notes = midis.map(midiToNoteName);
+      const events = buildNoteEvents(notes, midis, perfRef.current, 0.72);
+      const chordStart = startAt + chordIndex * chordStepSec;
+
+      events.forEach((event) => {
+        synth.triggerAttackRelease(
+          event.note,
+          releaseSec,
+          chordStart + Math.max(0, event.delayMs) / 1000,
+          Math.min(0.92, event.velocity)
+        );
+      });
+    });
+
+    previewTimerRef.current = window.setTimeout(
+      () => clearPreviewState(),
+      Math.ceil(chords.length * chordStepSec * 1000 + 360)
+    );
+  };
+
   const pushLog = (row: LogRow) => {
     setLogs((p) => [row, ...p].slice(0, 200));
     console.log("PLAY", row);
@@ -1160,6 +1318,7 @@ export default function Page() {
 
     // clear viz one-shot
     clearOneShotViz();
+    clearPreviewState();
     requestSyncActiveMidis();
   };
 
@@ -1640,10 +1799,12 @@ export default function Page() {
         <section style={styles.section}>
           <div style={styles.presetHead}>
             <div>
-              <div style={styles.stepLabel}>1. Progression Starter</div>
-              <div style={styles.label}>Start from a known progression</div>
+              <div style={styles.stepLabel}>1. Progression Library</div>
+              <div style={styles.label}>
+                Browse {STARTER_PRESETS.length} roman-first progression seeds
+              </div>
               <div style={styles.mutedSmall}>
-                日本を中心とした定番進行を seed にして、下の候補で変形します。
+                定番から少し変わったものまで、選んで鳴らして chord text に入れます。
               </div>
             </div>
             <div style={styles.presetControls}>
@@ -1672,9 +1833,22 @@ export default function Page() {
             <>
               <div style={styles.presetControls}>
                 <select
+                  value={progressionCategory}
+                  onChange={(e) => setProgressionCategory(e.target.value)}
+                  style={{ ...styles.select, width: 146 }}
+                >
+                  {(["All", ...PRESET_CATEGORIES] as const).map((category) => (
+                    <option key={category} value={category}>
+                      {category === "All"
+                        ? "All categories"
+                        : PRESET_CATEGORY_LABELS[category]}
+                    </option>
+                  ))}
+                </select>
+                <select
                   value={progressionGenre}
                   onChange={(e) => setProgressionGenre(e.target.value)}
-                  style={{ ...styles.select, width: 120 }}
+                  style={{ ...styles.select, width: 112 }}
                 >
                   {(["All", ...PRESET_GENRES] as const).map((genre) => (
                     <option key={genre} value={genre}>
@@ -1685,11 +1859,22 @@ export default function Page() {
                 <select
                   value={progressionMood}
                   onChange={(e) => setProgressionMood(e.target.value)}
-                  style={{ ...styles.select, width: 120 }}
+                  style={{ ...styles.select, width: 112 }}
                 >
                   {(["All", ...PRESET_MOODS] as const).map((mood) => (
                     <option key={mood} value={mood}>
                       {mood}
+                    </option>
+                  ))}
+                </select>
+                <select
+                  value={progressionUseCase}
+                  onChange={(e) => setProgressionUseCase(e.target.value)}
+                  style={{ ...styles.select, width: 124 }}
+                >
+                  {(["All", ...PRESET_USE_CASES] as const).map((useCase) => (
+                    <option key={useCase} value={useCase}>
+                      {useCase === "All" ? "Any use" : useCase}
                     </option>
                   ))}
                 </select>
@@ -1710,51 +1895,130 @@ export default function Page() {
                   value={progressionSearch}
                   onChange={(e) => setProgressionSearch(e.target.value)}
                   style={styles.searchInput}
-                  placeholder="search"
+                  placeholder="search name, roman, chords"
                 />
+                <div style={styles.segmented}>
+                  {(["both", "chords", "roman"] as const).map((mode) => (
+                    <button
+                      key={mode}
+                      type="button"
+                      onClick={() => setPresetDisplayMode(mode)}
+                      aria-pressed={presetDisplayMode === mode}
+                      style={{
+                        ...styles.segmentButton,
+                        ...(presetDisplayMode === mode
+                          ? styles.segmentButtonOn
+                          : {}),
+                      }}
+                    >
+                      {mode === "both"
+                        ? "Both"
+                        : mode === "chords"
+                          ? "Chords"
+                          : "Roman"}
+                    </button>
+                  ))}
+                </div>
               </div>
 
-              <div style={styles.presetGrid}>
+              <div style={styles.libraryMeta}>
+                Showing {visiblePresetCards.length} of {visibleProgressions.length}
+                {visibleProgressions.length !== STARTER_PRESETS.length
+                  ? ` filtered from ${STARTER_PRESETS.length}`
+                  : ""}
+              </div>
+
+              <div style={styles.presetList}>
                 {visiblePresetCards.map(({ preset, romanLabel, chords }) => {
                   const chordLabel = chords.join(" ");
                   const presetTags = [
-                    preset.genres[0],
-                    preset.moods[0],
+                    PRESET_CATEGORY_LABELS[preset.category],
+                    preset.genres.slice(0, 2).join(" / "),
+                    preset.moods.slice(0, 2).join(" / "),
+                    preset.useCases.slice(0, 2).join(" / "),
                     `C${preset.complexity}`,
                   ]
                     .filter(Boolean)
                     .join(" / ");
+                  const vibe = preset.vibeExamples?.slice(0, 2).join(" / ");
                   return (
                     <div key={preset.id} style={styles.presetItem}>
-                      <button
-                        type="button"
-                        onClick={() => applyProgression(preset)}
-                        style={styles.presetMain}
-                        title={`${preset.description} ${chordLabel}`}
-                      >
-                        <span style={styles.presetName}>{preset.name}</span>
-                        <span style={styles.presetAlias}>{romanLabel}</span>
-                        <span style={styles.presetChords}>{chordLabel}</span>
-                        <span style={styles.presetTags}>{presetTags}</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => appendProgression(preset)}
-                        style={styles.presetAppend}
-                        title="Append to chord list"
-                      >
-                        +
-                      </button>
+                      <div style={styles.presetMain}>
+                        <div style={styles.presetTopLine}>
+                          <span style={styles.presetName}>{preset.name}</span>
+                          <span style={styles.presetTags}>{presetTags}</span>
+                        </div>
+                        {presetDisplayMode !== "chords" ? (
+                          <div style={styles.presetAlias}>{romanLabel}</div>
+                        ) : null}
+                        {presetDisplayMode !== "roman" ? (
+                          <div style={styles.presetChords}>{chordLabel}</div>
+                        ) : null}
+                        <div style={styles.presetDescription}>
+                          {preset.description}
+                        </div>
+                        {vibe ? (
+                          <div style={styles.presetVibe}>
+                            Similar vibe: {vibe}
+                          </div>
+                        ) : null}
+                      </div>
+                      <div style={styles.presetActions}>
+                        <button
+                          type="button"
+                          onClick={() => playProgressionPreview(preset)}
+                          style={{
+                            ...styles.presetActionButton,
+                            ...(previewPresetId === preset.id
+                              ? styles.presetActionButtonOn
+                              : {}),
+                          }}
+                          title="Audition this progression"
+                        >
+                          {previewPresetId === preset.id ? "Playing" : "Play"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => applyProgression(preset)}
+                          style={styles.presetActionButton}
+                          title="Replace current chord text"
+                        >
+                          Use
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => appendProgression(preset)}
+                          style={styles.presetActionButton}
+                          title="Append to chord list"
+                        >
+                          Append
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => copyProgression(preset)}
+                          style={styles.presetActionButton}
+                          title="Copy converted chords"
+                        >
+                          {copiedPresetId === preset.id ? "Copied" : "Copy"}
+                        </button>
+                      </div>
                     </div>
                   );
                 })}
               </div>
 
               {visibleProgressions.length > visiblePresetCards.length ? (
-                <div style={styles.emptyHint}>
-                  Showing {visiblePresetCards.length} of {visibleProgressions.length}.
-                  Use category or search to narrow.
-                </div>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setPresetVisibleCount((count) =>
+                      Math.min(count + PRESET_RENDER_LIMIT, visibleProgressions.length)
+                    )
+                  }
+                  style={styles.showMoreButton}
+                >
+                  Show more
+                </button>
               ) : null}
 
               {visibleProgressions.length === 0 ? (
@@ -2967,7 +3231,7 @@ const styles: Record<string, React.CSSProperties> = {
     marginBottom: 8,
   },
   searchInput: {
-    width: 120,
+    width: 184,
     height: 34,
     borderRadius: 8,
     border: "1px solid rgba(148,163,184,0.30)",
@@ -2976,27 +3240,44 @@ const styles: Record<string, React.CSSProperties> = {
     padding: "0 10px",
     fontSize: 12,
   },
+  libraryMeta: {
+    color: "#64748b",
+    fontSize: 11,
+    fontWeight: 900,
+    marginBottom: 8,
+  },
+  presetList: {
+    display: "grid",
+    gap: 8,
+  },
   presetGrid: {
     display: "grid",
     gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
     gap: 8,
   },
   presetItem: {
-    display: "grid",
-    gridTemplateColumns: "1fr 34px",
-    gap: 6,
+    display: "flex",
+    flexWrap: "wrap",
+    gap: 10,
+    alignItems: "center",
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.22)",
+    background: "#ffffff",
+    padding: 10,
   },
   presetMain: {
-    minHeight: 74,
-    borderRadius: 8,
-    border: "1px solid rgba(148,163,184,0.24)",
-    background: "#ffffff",
+    flex: "1 1 360px",
+    minWidth: 0,
     color: "#172033",
-    padding: "9px 10px",
     textAlign: "left",
-    cursor: "pointer",
     display: "grid",
-    gap: 3,
+    gap: 4,
+  },
+  presetTopLine: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "baseline",
+    gap: 10,
   },
   presetName: {
     fontSize: 12,
@@ -3032,6 +3313,57 @@ const styles: Record<string, React.CSSProperties> = {
     cursor: "pointer",
     fontWeight: 900,
     fontSize: 18,
+  },
+  presetDescription: {
+    color: "#334155",
+    fontSize: 11,
+    fontWeight: 750,
+    lineHeight: 1.35,
+  },
+  presetVibe: {
+    color: "#64748b",
+    fontSize: 10,
+    fontWeight: 800,
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  },
+  presetActions: {
+    flex: "0 1 230px",
+    display: "flex",
+    gap: 6,
+    alignItems: "center",
+    flexWrap: "wrap",
+    justifyContent: "flex-end",
+    maxWidth: 230,
+  },
+  presetActionButton: {
+    height: 30,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#ffffff",
+    color: "#334155",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 11,
+    padding: "0 9px",
+  },
+  presetActionButtonOn: {
+    border: "1px solid rgba(20,184,166,0.42)",
+    background: "#ecfeff",
+    color: "#0f766e",
+  },
+  showMoreButton: {
+    width: "100%",
+    height: 34,
+    marginTop: 8,
+    borderRadius: 8,
+    border: "1px solid rgba(148,163,184,0.30)",
+    background: "#f8fafc",
+    color: "#334155",
+    cursor: "pointer",
+    fontWeight: 900,
+    fontSize: 12,
   },
 
   smartHead: {
